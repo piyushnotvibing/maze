@@ -1,5 +1,9 @@
 use crate::{
-    file::{header::HEADER_SIZE, varint},
+    file::{
+        header::HEADER_SIZE,
+        record::{Record, Value},
+        varint,
+    },
     utils::{read_word_u16_be, read_word_u64_be},
 };
 
@@ -81,6 +85,11 @@ impl TableLeafCell {
         bytes.extend(varint::encode(self.row_id));
         bytes.extend_from_slice(&self.payload);
         bytes
+    }
+
+    fn decode_payload(&self) -> anyhow::Result<Vec<Value>> {
+        let record = Record::build(&self.payload)?;
+        Ok(record.body)
     }
 }
 
@@ -232,5 +241,74 @@ mod tests {
             (parsed.size, parsed.row_id, parsed.payload),
             (3, 300, b"abc".to_vec())
         );
+    }
+
+    #[test]
+    fn payload_decodes_into_a_value_array_correctly() {
+        const PAGE_SIZE: usize = 512;
+        let base = HEADER_SIZE; // page 1: leaf starts right after the file header
+        let leaf_len = PAGE_SIZE - base;
+
+        // Each row: (row_id, column values). Row 2 has a 200-byte blob and rowid 300,
+        // so its size varint, rowid varint, and blob serial type are all 2 bytes.
+        let rows: Vec<(u64, Vec<Value>)> = vec![
+            (
+                1,
+                vec![Value::Int(-5), Value::Text("Ada".into()), Value::Null],
+            ),
+            (
+                300,
+                vec![
+                    Value::Blob(vec![7u8; 200]),
+                    Value::Float(1.5),
+                    Value::Text("x".into()),
+                ],
+            ),
+        ];
+
+        // payload = encoded record; cell = varint(payload len) | varint(row_id) | payload
+        let cells: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|(id, values)| {
+                let payload = Record::new(values.clone()).unwrap().encode();
+                cell_bytes(*id, &payload)
+            })
+            .collect();
+
+        // Pack cells contiguously at the end of the leaf; offsets come from real lengths.
+        let total: usize = cells.iter().map(Vec::len).sum();
+        let content_offset = leaf_len - total;
+        let ptrs_end = 5 + 2 * cells.len();
+        assert!(
+            content_offset >= ptrs_end,
+            "test cells don't fit in the page"
+        );
+
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut ptrs: Vec<u16> = Vec::new();
+        let mut at = content_offset;
+        for c in &cells {
+            ptrs.push(at as u16);
+            buf[base + at..base + at + c.len()].copy_from_slice(c);
+            at += c.len();
+        }
+
+        // Leaf header: type(1) | cell count(2) | content offset(2), then the pointer array.
+        buf[base] = PageType::TableLeaf.into();
+        buf[base + 1..base + 3].copy_from_slice(&(cells.len() as u16).to_be_bytes());
+        buf[base + 3..base + 5].copy_from_slice(&(content_offset as u16).to_be_bytes());
+        for (i, p) in ptrs.iter().enumerate() {
+            let o = base + 5 + 2 * i;
+            buf[o..o + 2].copy_from_slice(&p.to_be_bytes());
+        }
+
+        let page = Page::from(&buf, 1).unwrap();
+        let Page::TableLeaf(leaf) = page;
+
+        assert_eq!(leaf.cells.len(), rows.len());
+        for (cell, (row_id, expected)) in leaf.cells.iter().zip(&rows) {
+            assert_eq!(cell.row_id, *row_id);
+            assert_eq!(&cell.decode_payload().unwrap(), expected);
+        }
     }
 }
