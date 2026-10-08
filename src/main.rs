@@ -1,3 +1,5 @@
+#![warn(clippy::all)]
+
 mod file;
 mod utils;
 

@@ -33,3 +33,7 @@
 | 0 | 14 | Header string "Maze format 1\0" |
 | 14 | 1 | Page size $\in$ [9, 16] |
 <!-- | 15 | 8 | Pointer to first Freelist block | -->
+
+Database header size = 15B (as of now)
+
+![alt text](theory/images/image.png)
