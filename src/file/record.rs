@@ -5,8 +5,8 @@ pub enum Value {
     Null,
     Int(i64),
     Float(f64),
-    Text(String),
     Blob(Vec<u8>),
+    Text(String),
 }
 
 impl Value {
@@ -15,45 +15,78 @@ impl Value {
             Value::Null => Vec::new(),
             Value::Int(i) => i.to_be_bytes().to_vec(),
             Value::Float(f) => f.to_be_bytes().to_vec(),
-            Value::Text(t) => t.as_bytes().to_vec(),
             Value::Blob(b) => b.clone(),
+            Value::Text(t) => t.as_bytes().to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DataType {
+    Null,
+    Int,
+    Float,
+    Blob(u64),
+    Text(u64),
+}
+
+impl From<&Value> for DataType {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Null => DataType::Null,
+            Value::Int(_) => DataType::Int,
+            Value::Float(_) => DataType::Float,
+            Value::Blob(b) => DataType::Blob(b.len() as u64),
+            Value::Text(t) => DataType::Text(t.len() as u64),
+        }
+    }
+}
+
+/*
+    ----------------------------------------------------------------
+    | Tag                     ->        Value                      |
+    | ------------------------------------------------------------ |
+    | 0                       ->        Null                       |
+    | 6                       ->        Signed 64 bit int          |
+    | 7                       ->        64 bit float               |
+    | >= 12 && tag % 2 == 0   ->        BLOB                       |
+    | >= 13 && tag % 2 == 1   ->        Text                       |
+    ----------------------------------------------------------------
+*/
+impl DataType {
+    fn new(code: u64) -> anyhow::Result<Self> {
+        match code {
+            0 => Ok(DataType::Null),
+            6 => Ok(DataType::Int),
+            7 => Ok(DataType::Float),
+            _ => {
+                let code_is_even = code.is_multiple_of(2);
+                if code >= 12 && code_is_even {
+                    Ok(DataType::Blob((code - 12) / 2))
+                } else if code >= 13 && !code_is_even {
+                    Ok(DataType::Text((code - 13) / 2))
+                } else {
+                    anyhow::bail!("invalid code, no corresponding data type")
+                }
+            }
         }
     }
 
-    /*
-        ----------------------------------------------------------------
-        | Tag                     ->        Value                      |
-        | ------------------------------------------------------------ |
-        | 0                       ->        Null                       |
-        | 6                       ->        Signed 64 bit int          |
-        | 7                       ->        64 bit float               |
-        | >= 12 && tag % 2 == 0   ->        BLOB                       |
-        | >= 13 && tag % 2 == 1   ->        Text                       |
-        ----------------------------------------------------------------
-    */
-    pub fn get_tag(&self) -> anyhow::Result<u64> {
+    fn code(&self) -> anyhow::Result<u64> {
         match self {
-            Value::Null => Ok(0),
-            Value::Int(_) => Ok(6),
-            Value::Float(_) => Ok(7),
-            Value::Text(t) => {
-                let tag = t
-                    .len()
-                    .checked_mul(2)
-                    .ok_or_else(|| anyhow::anyhow!("text size is too long"))?
-                    .checked_add(13)
-                    .ok_or_else(|| anyhow::anyhow!("text size is too long"))?;
-                Ok(tag as u64)
-            }
-            Value::Blob(items) => {
-                let tag = items
-                    .len()
-                    .checked_mul(2)
-                    .ok_or_else(|| anyhow::anyhow!("blob size is too long"))?
-                    .checked_add(12)
-                    .ok_or_else(|| anyhow::anyhow!("blob size is too long"))?;
-                Ok(tag as u64)
-            }
+            DataType::Null => Ok(0),
+            DataType::Int => Ok(6),
+            DataType::Float => Ok(7),
+            DataType::Blob(blob_len) => 2u64
+                .checked_mul(*blob_len as u64)
+                .ok_or_else(|| anyhow::anyhow!("blob size too big for u64"))?
+                .checked_add(12)
+                .ok_or_else(|| anyhow::anyhow!("blob size too big for u64")),
+            DataType::Text(text_len) => 2u64
+                .checked_mul(*text_len as u64)
+                .ok_or_else(|| anyhow::anyhow!("text size too big for u64"))?
+                .checked_add(13)
+                .ok_or_else(|| anyhow::anyhow!("text size too big for u64")),
         }
     }
 }
@@ -61,7 +94,7 @@ impl Value {
 #[derive(Debug, Clone)]
 pub struct RecordHeader {
     // The column tags of each column in the schema, varint encoded.
-    pub column_types: Vec<u64>,
+    pub column_codes: Vec<u64>,
 }
 
 impl RecordHeader {
@@ -71,26 +104,26 @@ impl RecordHeader {
         let header_len = usize::try_from(header_len)?;
         buf = &buf[bytes_read..];
 
-        let mut serial_type_len = usize::try_from(header_len)?
+        let mut serial_type_len = header_len
             .checked_sub(bytes_read)
             .ok_or_else(|| anyhow::anyhow!("header is smaller than its own length's varint?"))?;
-        let mut column_types = Vec::new();
+        let mut column_codes = Vec::new();
         while serial_type_len != 0 {
             let (serial_type, bytes_read) =
                 varint::decode(buf).ok_or(anyhow::anyhow!("invalid serial type varint"))?;
-            column_types.push(serial_type);
+            column_codes.push(serial_type);
             buf = &buf[bytes_read..];
             serial_type_len = serial_type_len
                 .checked_sub(bytes_read)
                 .ok_or_else(|| anyhow::anyhow!("serial_type_len is incorrect"))?;
         }
 
-        Ok((RecordHeader { column_types }, header_len))
+        Ok((RecordHeader { column_codes }, header_len))
     }
 
     fn encode(&self) -> Vec<u8> {
         let types = self
-            .column_types
+            .column_codes
             .iter()
             .flat_map(|&t| varint::encode(t))
             .collect::<Vec<u8>>();
@@ -120,12 +153,12 @@ pub struct Record {
 
 impl Record {
     pub fn new(values: Vec<Value>) -> anyhow::Result<Self> {
-        let column_types = values
+        let column_codes = values
             .iter()
-            .map(Value::get_tag)
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .map(|value| DataType::from(value).code())
+            .collect::<anyhow::Result<Vec<u64>>>()?;
         Ok(Record {
-            header: RecordHeader { column_types },
+            header: RecordHeader { column_codes },
             body: values,
         })
     }
@@ -138,31 +171,22 @@ impl Record {
 
         let mut body = Vec::new();
         let mut offset = 0usize;
-        for &column_type in header.column_types.iter() {
+        for &column_code in header.column_codes.iter() {
+            let column_type = DataType::new(column_code)?;
             match column_type {
-                0 => body.push(Value::Null), // If value is null, no need to increment offset.
-                6 => body.push(Value::Int(i64::from_be_bytes(
+                DataType::Null => body.push(Value::Null), // If value is null, no need to increment offset.
+                DataType::Int => body.push(Value::Int(i64::from_be_bytes(
                     take(buf, &mut offset, 8)?.try_into()?,
                 ))),
-                7 => body.push(Value::Float(f64::from_be_bytes(
+                DataType::Float => body.push(Value::Float(f64::from_be_bytes(
                     take(buf, &mut offset, 8)?.try_into()?,
                 ))),
-                _ => {
-                    let column_type_is_even = column_type % 2 == 0;
-                    if column_type >= 12 && column_type_is_even {
-                        let bytes_to_read = (usize::try_from(column_type)? - 12) / 2;
-                        body.push(Value::Blob(
-                            (take(buf, &mut offset, bytes_to_read))?.to_vec(),
-                        ));
-                    } else if column_type >= 13 && !column_type_is_even {
-                        let bytes_to_read = (usize::try_from(column_type)? - 13) / 2;
-                        body.push(Value::Text(String::from_utf8(
-                            (take(buf, &mut offset, bytes_to_read))?.to_vec(),
-                        )?));
-                    } else {
-                        anyhow::bail!("invalid serial type")
-                    }
-                }
+                DataType::Blob(blob_len) => body.push(Value::Blob(
+                    (take(buf, &mut offset, usize::try_from(blob_len)?))?.to_vec(),
+                )),
+                DataType::Text(text_len) => body.push(Value::Text(String::from_utf8(
+                    (take(buf, &mut offset, usize::try_from(text_len)?))?.to_vec(),
+                )?)),
             }
         }
 
