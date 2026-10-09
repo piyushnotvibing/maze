@@ -104,18 +104,18 @@ impl RecordHeader {
         let header_len = usize::try_from(header_len)?;
         buf = &buf[bytes_read..];
 
-        let mut serial_type_len = header_len
+        let mut data_types_len = header_len
             .checked_sub(bytes_read)
             .ok_or_else(|| anyhow::anyhow!("header is smaller than its own length's varint?"))?;
         let mut column_codes = Vec::new();
-        while serial_type_len != 0 {
-            let (serial_type, bytes_read) =
+        while data_types_len != 0 {
+            let (data_type, bytes_read) =
                 varint::decode(buf).ok_or(anyhow::anyhow!("invalid serial type varint"))?;
-            column_codes.push(serial_type);
+            column_codes.push(data_type);
             buf = &buf[bytes_read..];
-            serial_type_len = serial_type_len
+            data_types_len = data_types_len
                 .checked_sub(bytes_read)
-                .ok_or_else(|| anyhow::anyhow!("serial_type_len is incorrect"))?;
+                .ok_or_else(|| anyhow::anyhow!("data_types_len is incorrect"))?;
         }
 
         Ok((RecordHeader { column_codes }, header_len))

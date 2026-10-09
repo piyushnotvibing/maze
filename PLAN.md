@@ -89,7 +89,7 @@ built on top of it.
       single-page database with a header + a few leaf cells by hand in a
       test function, parse it, and assert the resulting `Page`/`HeaderInfo`
       match what you encoded.
-- [ ] Write a symmetric serializer: `HeaderInfo::to_bytes()` and a page
+- [ ] Write a symmetric serializer: `HeaderInfo::serialize()` and a page
       serializer for `TableLeafPage`, so you can round-trip
       bytes → struct → bytes and assert equality. (You don't have a pager
       yet — these just operate on `Vec<u8>`/`&mut [u8]` for now.)

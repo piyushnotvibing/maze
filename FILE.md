@@ -37,3 +37,6 @@
 Database header size = 15B (as of now)
 
 ![alt text](theory/images/image.png)
+
+## b-tree Page Cells
+- A cell's (interior or leaf page cell) `row_id` can be 0. The first cell's `row_id` must be 0.
