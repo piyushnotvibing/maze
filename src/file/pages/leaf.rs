@@ -51,6 +51,7 @@ impl TryFrom<&[u8]> for TableLeafPage {
 
         let mut prev_row_id: Option<u64> = None;
         let mut spans: Vec<(usize, usize)> = Vec::with_capacity(cell_ptrs.len());
+
         let cells = cell_ptrs
             .iter()
             .map(|&ptr| {

@@ -15,12 +15,11 @@
     interior cell = u32 left_child (4 bytes, big-endian) | varint row_id
 */
 
-use crate::{
-    file::{
-        pages::{PageNumber, PageType, pack_page, parse_cell_ptrs, parse_header},
-        varint,
+use crate::file::{
+    pages::{
+        PageNumber, PageType, bytes::read_word_u32_be, pack_page, parse_cell_ptrs, parse_header,
     },
-    utils::read_word_u32_be,
+    varint,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

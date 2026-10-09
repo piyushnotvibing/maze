@@ -1,12 +1,15 @@
 pub mod interior;
 pub mod leaf;
 
-use crate::{
-    file::{
-        header::HEADER_SIZE,
-        pages::{interior::TableInteriorPage, leaf::TableLeafPage},
+mod bytes;
+
+use crate::file::{
+    header::HEADER_SIZE,
+    pages::{
+        bytes::{read_word_u16_be, read_word_u32_be},
+        interior::TableInteriorPage,
+        leaf::TableLeafPage,
     },
-    utils::{read_word_u16_be, read_word_u32_be},
 };
 
 const PAGE_CELL_COUNT_OFFSET: usize = 1;
@@ -81,7 +84,7 @@ impl PageType {
 impl From<PageType> for u8 {
     fn from(value: PageType) -> Self {
         match value {
-            PageType::TableLeaf => 10,
+            PageType::TableLeaf => 13,
             PageType::TableInterior => 5,
         }
     }
@@ -92,7 +95,7 @@ impl TryFrom<u8> for PageType {
 
     fn try_from(value: u8) -> anyhow::Result<Self> {
         match value {
-            10 => Ok(PageType::TableLeaf),
+            13 => Ok(PageType::TableLeaf),
             5 => Ok(PageType::TableInterior),
             _ => anyhow::bail!("invalid page type"),
         }
