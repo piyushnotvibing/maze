@@ -1,5 +1,11 @@
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct PageNumber(u32);
+
+impl std::fmt::Display for PageNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 impl PageNumber {
     pub fn get(&self) -> u32 {
         self.0

@@ -1,8 +1,8 @@
+pub mod cell;
+pub mod header;
 pub mod interior;
 pub mod leaf;
 pub mod types;
-pub mod cell;
-pub mod header;
 
 mod bytes;
 
@@ -42,10 +42,10 @@ impl Page {
         }
     }
 
-    pub fn serialize(&self, usable_page_len: usize) -> anyhow::Result<Vec<u8>> {
+    pub fn serialize(&self, page_number: PageNumber, page_size: usize) -> anyhow::Result<Vec<u8>> {
         match self {
-            Page::TableLeaf(lp) => lp.serialize(usable_page_len),
-            Page::TableInterior(ip) => ip.serialize(usable_page_len),
+            Page::TableLeaf(lp) => lp.serialize(page_number, page_size),
+            Page::TableInterior(ip) => ip.serialize(page_number, page_size),
         }
     }
 
@@ -61,23 +61,25 @@ pub(crate) enum PageType {
 impl PageType {
     pub(crate) fn serialize<C: Cell>(
         &self,
+        page_number: PageNumber,
         rightmost_child: Option<PageNumber>,
         cells: &[C],
-        usable_page_len: usize,
+        page_size: usize,
     ) -> anyhow::Result<Vec<u8>> {
         let cells_bytes = cells
             .iter()
             .map(|c| c.serialize())
             .collect::<Vec<Vec<u8>>>();
 
-        self.pack(rightmost_child, &cells_bytes, usable_page_len)
+        self.pack(page_number, rightmost_child, &cells_bytes, page_size)
     }
 
     fn pack(
         self,
+        page_number: PageNumber,
         rightmost_child: Option<PageNumber>,
         cells: &[Vec<u8>],
-        usable_page_len: usize,
+        page_size: usize,
     ) -> anyhow::Result<Vec<u8>> {
         match self {
             PageType::TableInterior if rightmost_child.is_none() => {
@@ -88,8 +90,12 @@ impl PageType {
             }
             _ => {}
         }
+        let page_offset = match page_number.get() {
+            1 => HEADER_SIZE,
+            _ => 0,
+        };
 
-        let mut p_buf = vec![0u8; usable_page_len];
+        let mut p_buf = vec![0u8; page_size];
 
         /*
             A page's header contains:
@@ -102,7 +108,13 @@ impl PageType {
         let all_cells_len: usize = cells.iter().map(Vec::len).sum();
         let cell_count = cells.len();
         let cell_ptrs_region_end = header_size + 2 * cell_count;
-        let cell_content_offset = usable_page_len
+        let cell_content_offset = page_size
+            .checked_sub(page_offset)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "this error does not even make sense, if it happens i'll shave my moustache"
+                )
+            })?
             .checked_sub(all_cells_len)
             .filter(|&offset| offset >= cell_ptrs_region_end) // only get the calculated offset if it is greater than the last cell pointer's address
             .ok_or_else(|| anyhow::anyhow!("cells do not fit in page"))?;
@@ -114,23 +126,25 @@ impl PageType {
         };
 
         // Writing the page header.
-        p_buf[0] = self.into();
-        p_buf[1..3].copy_from_slice(&u16::try_from(cell_count)?.to_be_bytes());
-        p_buf[3..5].copy_from_slice(&stored_cell_content_offset.to_be_bytes());
+        p_buf[page_offset] = self.into();
+        p_buf[(page_offset + 1)..(page_offset + 3)]
+            .copy_from_slice(&u16::try_from(cell_count)?.to_be_bytes());
+        p_buf[(page_offset + 3)..(page_offset + 5)]
+            .copy_from_slice(&stored_cell_content_offset.to_be_bytes());
         if let Some(rc) = rightmost_child {
-            p_buf[5..9].copy_from_slice(&rc.get().to_be_bytes());
+            p_buf[(page_offset + 5)..(page_offset + 9)].copy_from_slice(&rc.get().to_be_bytes());
         }
 
-        // Writing cell pointers and cells simultaneously.
         let mut cell_ptr = cell_content_offset;
         for (i, cell) in cells.iter().enumerate() {
-            // Copy the cell.
-            p_buf[cell_ptr..cell_ptr + cell.len()].copy_from_slice(cell);
-            // Copy its pointer.
-            let cell_ptr_addr = header_size + 2 * i;
+            // Copy the cell, at its real (absolute) position in the buffer.
+            let abs_cell_start = page_offset + cell_ptr;
+            p_buf[abs_cell_start..abs_cell_start + cell.len()].copy_from_slice(cell);
+            
+            let cell_ptr_addr = page_offset + header_size + 2 * i;
             p_buf[cell_ptr_addr..cell_ptr_addr + 2]
                 .copy_from_slice(&u16::try_from(cell_ptr)?.to_be_bytes());
-            // Advance the pointer, this avoids fragmentation, ie, gaps between cells.
+
             cell_ptr += cell.len()
         }
 
@@ -169,7 +183,14 @@ impl TryFrom<u8> for PageType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{header::HEADER_SIZE, varint};
+    use crate::file::{
+        header::HEADER_SIZE,
+        pages::{
+            interior::{TableInteriorCell, TableInteriorPage},
+            leaf::TableLeafCell,
+        },
+        varint,
+    };
 
     // Build one cell: varint(payload len) | varint(row_id) | payload
     fn cell_bytes(row_id: u64, payload: &[u8]) -> Vec<u8> {
@@ -224,6 +245,68 @@ mod tests {
             }
         } else {
             panic!("invalid page type")
+        }
+    }
+
+    // Regression test for the bug where `pack`'s cell-pointer-array write
+    // forgot to add `page_offset`: for page 1, pointers landed in the
+    // reserved file-header region instead of after the page's own header,
+    // so a leaf/interior page with real cells failed to round-trip through
+    // serialize -> parse.
+    #[test]
+    fn leaf_page_round_trips_at_page_number_one() {
+        const PAGE_SIZE: usize = 512;
+        let pn1 = PageNumber::try_from(1).unwrap();
+
+        let original = TableLeafPage {
+            cells: vec![
+                TableLeafCell {
+                    row_id: 1,
+                    payload: b"abc".to_vec(),
+                },
+                TableLeafCell {
+                    row_id: 300,
+                    payload: vec![7u8; 50],
+                },
+            ],
+        };
+
+        let bytes = Page::TableLeaf(original.clone())
+            .serialize(pn1, PAGE_SIZE)
+            .unwrap();
+
+        // The file-header region must stay untouched by page-serialization
+        // code — only the Pager/MazeHeader should ever write there.
+        assert_eq!(&bytes[0..HEADER_SIZE], vec![0u8; HEADER_SIZE].as_slice());
+
+        match Page::parse(&bytes, pn1).unwrap() {
+            Page::TableLeaf(parsed) => assert_eq!(parsed, original),
+            Page::TableInterior(_) => panic!("expected a leaf page back"),
+        }
+    }
+
+    #[test]
+    fn interior_page_round_trips_at_page_number_one() {
+        const PAGE_SIZE: usize = 512;
+        let pn1 = PageNumber::try_from(1).unwrap();
+
+        let original = TableInteriorPage {
+            cells: vec![TableInteriorCell {
+                left_child: PageNumber::try_from(5).unwrap(),
+                row_id: 100,
+            }],
+            rightmost_child: PageNumber::try_from(6).unwrap(),
+        };
+
+        let bytes = Page::TableInterior(original.clone())
+            .serialize(pn1, PAGE_SIZE)
+            .unwrap();
+
+        assert_eq!(&bytes[0..HEADER_SIZE], vec![0u8; HEADER_SIZE].as_slice());
+
+        match Page::parse(&bytes, pn1).unwrap() {
+            Page::TableInterior(parsed) => assert_eq!(parsed, original),
+            Page::TableLeaf(_) => panic!("expected an interior page back"),
         }
     }
 }

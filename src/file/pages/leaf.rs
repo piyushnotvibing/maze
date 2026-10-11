@@ -2,6 +2,7 @@ use crate::file::{
     pages::{
         PageHeader, PageType,
         cell::{Cell, parse_cells},
+        types::PageNumber,
     },
     record::{Record, Value},
     varint,
@@ -13,9 +14,9 @@ pub struct TableLeafPage {
 }
 
 impl TableLeafPage {
-    pub fn serialize(&self, usable_page_len: usize) -> anyhow::Result<Vec<u8>> {
+    pub fn serialize(&self, page_number: PageNumber, page_size: usize) -> anyhow::Result<Vec<u8>> {
         let no_rightmost_child = None;
-        PageType::TableLeaf.serialize(no_rightmost_child, &self.cells, usable_page_len)
+        PageType::TableLeaf.serialize(page_number, no_rightmost_child, &self.cells, page_size)
     }
 }
 

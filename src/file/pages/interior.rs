@@ -27,7 +27,7 @@ pub struct TableInteriorPage {
 }
 
 impl TableInteriorPage {
-    pub fn serialize(&self, usable_page_len: usize) -> anyhow::Result<Vec<u8>> {
+    pub fn serialize(&self, page_number: PageNumber, page_size: usize) -> anyhow::Result<Vec<u8>> {
         let mut prev_row_id: Option<u64> = None;
         for cell in self.cells.iter() {
             if let Some(prev_row_id) = prev_row_id
@@ -38,7 +38,7 @@ impl TableInteriorPage {
             prev_row_id = Some(cell.row_id);
         }
 
-        PageType::TableInterior.serialize(Some(self.rightmost_child), &self.cells, usable_page_len)
+        PageType::TableInterior.serialize(page_number, Some(self.rightmost_child), &self.cells, page_size)
     }
 }
 
