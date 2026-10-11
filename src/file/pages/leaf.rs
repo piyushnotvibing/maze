@@ -90,7 +90,7 @@ impl TryFrom<&[u8]> for TableLeafCell {
 mod tests {
     use super::*;
     use crate::file::{
-        header::HEADER_SIZE,
+        header::MAZE_HEADER_SIZE,
         pages::{Page, PageNumber, leaf::TableLeafCell},
         record::{Record, Value},
     };
@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn payload_decodes_into_a_value_array_correctly() {
         const PAGE_SIZE: usize = 512;
-        let base = HEADER_SIZE; // page 1: leaf starts right after the file header
+        let base = MAZE_HEADER_SIZE; // page 1: leaf starts right after the file header
         let leaf_len = PAGE_SIZE - base;
 
         // Each row: (row_id, column values). Row 2 has a 200-byte blob and rowid 300,

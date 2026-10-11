@@ -6,6 +6,7 @@ principles of database management systems: page-based storage, B-trees and
 B+trees, indexing, query execution, and transactions.
 
 **Ground rules for this project:**
+
 - Hand-roll everything that's a learning surface: pages, varints, records,
   B-trees, the SQL lexer/parser, the planner/executor, and transactions.
   No parser-combinator crates, no SQL crates, no B-tree/collection crates.
@@ -44,10 +45,11 @@ build`/`cargo test` must mean something.
 internally consistent and testable.
 
 **Checklist**
+
 - [ ] Reconcile `FILE.md`'s documented page-size-byte offset (14) with
       `header.rs::HEADER_PAGE_SIZE_OFFSET` (currently 16) — decide which is
       correct and fix the other.
-- [ ] Re-derive and document `HEADER_SIZE` (currently a bare `23` with no
+- [ ] Re-derive and document `MAZE_HEADER_SIZE` (currently a bare `23` with no
       justification in `FILE.md` or in a comment).
 - [ ] Add a `tests/` directory (integration tests) alongside the existing
       inline unit tests.
@@ -70,15 +72,16 @@ built on top of it.
 **What you'll build:** `src/file/varint.rs`, and fixes to `page.rs`.
 
 **Checklist**
+
 - [ ] Write `varint::encode(u64) -> Vec<u8>` and `varint::decode(&[u8]) ->
-      (u64, usize)` implementing SQLite-style variable-length integers
+    (u64, usize)` implementing SQLite-style variable-length integers
       (1–8 bytes each contributing 7 bits with a continuation bit, 9th byte
       special-cased to contribute a full 8 bits). Write round-trip property
       tests (`encode` then `decode` recovers the original value) across the
       value space, including edge values (0, 2^7-1, 2^7, u64::MAX).
   - [ ] Replace `TableLeafCell`'s fixed 8-byte `size`/`row_id` reads
-      (`read_word_u64_be`) with varint reads. Update `parse_table_leaf_cell`
-      accordingly.
+        (`read_word_u64_be`) with varint reads. Update `parse_table_leaf_cell`
+        accordingly.
 - [ ] Fix `parse_table_leaf_page`'s content-buffer bug: it always slices at
       `LEAF_PAGE_HEADER_SIZE`, ignoring `leaf_data_offset` on the first page.
       Make the first page (which has the 23-byte file header in front of its
@@ -110,6 +113,7 @@ cells sit on a page."
 **What you'll build:** `src/file/record.rs`.
 
 **Checklist**
+
 - [ ] Define a `Value` enum for the column types you'll support to start:
       `Null`, `Int(i64)` (pick one or a few widths), `Float(f64)`,
       `Text(String)`, `Blob(Vec<u8>)`.
@@ -139,6 +143,7 @@ the original values back out.
 `src/btree/` module with a `Cursor`.
 
 **Checklist**
+
 - [ ] Implement `PageType::TableInterior` parsing (currently `todo!()` in
       `parse_page`): a list of `(child_page_number, max_row_id_in_subtree)`
       cells plus the existing `rightmost_child` pointer.
@@ -173,11 +178,12 @@ basic buffer-pool management — a concept central to every real DBMS.
 **What you'll build:** `src/pager/mod.rs`.
 
 **Checklist**
+
 - [ ] Define `PageId = u32` and a `Pager` struct wrapping a `std::fs::File`
       opened with read/write access, plus the page size (read from the
       header on open).
 - [ ] Implement `Pager::open(path) -> anyhow::Result<Pager>`: read the first
-      100... er, 23-ish bytes (whatever `HEADER_SIZE` ends up being) to get
+      100... er, 23-ish bytes (whatever `MAZE_HEADER_SIZE` ends up being) to get
       the page size, validate the magic string.
 - [ ] Implement `Pager::create(path, page_size) -> anyhow::Result<Pager>`
       for brand-new files (write a fresh header + an empty root leaf page).
@@ -208,6 +214,7 @@ most people mean when they say "I want to understand B-trees."
 **What you'll build:** insert logic in `src/btree/`.
 
 **Checklist**
+
 - [ ] Implement `Cursor`/`BTree::insert(row_id, payload: &[u8])`: descend to
       the correct leaf, insert the new cell in sorted position among
       existing cell pointers, shifting pointers as needed.
@@ -248,6 +255,7 @@ sorted order with invariants holding.
 **What you'll build:** delete logic in `src/btree/`.
 
 **Checklist**
+
 - [ ] Implement leaf delete: locate the cell by row id, remove its pointer,
       compact the cell-pointer array (you can leave the "hole" in the cell
       content area unreclaimed for now — note that as a simplification that
@@ -284,6 +292,7 @@ a single page.
 in `src/file/`.
 
 **Checklist**
+
 - [ ] Implement the freelist per `FILE.md`'s structure (trunk pages holding
       pointers to leaf/free pages): `Pager::free_page(id)` pushes onto the
       freelist, `Pager::allocate_page()` pops from it first before
@@ -316,12 +325,13 @@ file size doesn't grow when inserts reuse freed capacity).
 **Learning goal:** the practical difference between a table B-tree (keyed
 by row id, leaf carries the full row) and an index B-tree (keyed by an
 indexed column's value, leaf carries a pointer back to the row id) — this
-*is* the B+tree half of "B-trees and B+trees" from the original goal.
+_is_ the B+tree half of "B-trees and B+trees" from the original goal.
 
 **What you'll build:** `IndexLeafCell`/`IndexInteriorCell` in `page.rs`,
 index-aware insert/delete/search in `src/btree/`.
 
 **Checklist**
+
 - [ ] Define index cell types: a leaf cell holds `(key: Record, row_id)`;
       interior cells hold separator keys + child pointers, same shape as
       table interior pages but comparing on the indexed value instead of
@@ -358,8 +368,9 @@ between "storage engine" and "SQL layer."
 **What you'll build:** `src/catalog/mod.rs`, a `maze_master` system table.
 
 **Checklist**
+
 - [ ] Design the `maze_master` row shape: `(type: "table"|"index", name,
-      table_name, root_page: u32, sql: String)` — `sql` stores the original
+    table_name, root_page: u32, sql: String)` — `sql` stores the original
       `CREATE TABLE`/`CREATE INDEX` text (once Subproject 10 exists) or for
       now just a structured schema description.
 - [ ] Reserve page 1 (or whatever your root page convention is) as the
@@ -369,7 +380,7 @@ between "storage engine" and "SQL layer."
       scan `maze_master` on open and build an in-memory map of table/index
       name → (root page, column schema).
 - [ ] Implement `Catalog::create_table(&mut Pager, name, columns) ->
-      anyhow::Result<()>`: allocate a root page for the new table, insert
+    anyhow::Result<()>`: allocate a root page for the new table, insert
       its row into `maze_master`, update the in-memory map.
 - [ ] Implement `Catalog::create_index(...)` similarly.
 - [ ] Implement basic validation helpers: does a table/index exist, does a
@@ -395,6 +406,7 @@ text yet.
 `src/sql/parser.rs`.
 
 **Checklist**
+
 - [ ] Define a `Token` enum: keywords (`CREATE`, `TABLE`, `INDEX`, `INSERT`,
       `INTO`, `VALUES`, `SELECT`, `FROM`, `WHERE`, `ORDER`, `BY`, `LIMIT`,
       `UPDATE`, `SET`, `DELETE`, `AND`, `OR`, `NULL`, type names, etc.),
@@ -429,8 +441,9 @@ the iterator-based ("Volcano style") execution model used by real engines.
 **What you'll build:** `src/exec/plan.rs`, `src/exec/executor.rs`.
 
 **Checklist**
+
 - [ ] Define a small logical plan enum: `Scan(table)`, `IndexScan(index,
-      key_or_range)`, `Filter(plan, expr)`, `Project(plan, columns)`,
+    key_or_range)`, `Filter(plan, expr)`, `Project(plan, columns)`,
       `Sort(plan, columns)`, `Limit(plan, n)`.
 - [ ] Implement a trivial planner: for `SELECT ... WHERE col = <literal>`,
       check the catalog for an index on `col` and emit `IndexScan`;
@@ -444,7 +457,7 @@ the iterator-based ("Volcano style") execution model used by real engines.
       into catalog lookups + `btree` operations, and crucially keep any
       secondary indexes (Subproject 8) in sync on every mutation.
 - [ ] Tie it together: a `Database` type exposing `execute(sql: &str) ->
-      anyhow::Result<QueryResult>` that lexes, parses, plans, and executes
+    anyhow::Result<QueryResult>` that lexes, parses, plans, and executes
       in one call.
 - [ ] Test end-to-end: create a table, insert rows via SQL text, select
       with and without `WHERE`, with `ORDER BY`/`LIMIT`, update and delete
@@ -465,6 +478,7 @@ implementable by hand.
 **What you'll build:** `src/txn/mod.rs`, a rollback-journal mechanism.
 
 **Checklist**
+
 - [ ] Implement a rollback journal: before `Pager` first modifies a page
       within a transaction, copy that page's pre-image (original bytes +
       page number) to a journal file.
@@ -500,6 +514,7 @@ use.
 extended `main.rs`).
 
 **Checklist**
+
 - [ ] Build a REPL loop: read a line from stdin, if it starts with `.` treat
       it as a dot-command (`.tables`, `.schema [table]`, `.open <file>`,
       `.quit`), otherwise feed it to `Database::execute` and pretty-print

@@ -1,38 +1,39 @@
-use std::collections::HashMap;
-
-use crate::file::pages::{Page, leaf::TableLeafCell, types::PageNumber};
+use crate::file::{
+    pager::Pager,
+    pages::{Page, leaf::TableLeafCell, types::PageNumber},
+};
 
 pub struct Cursor<'a> {
-    pages: &'a HashMap<PageNumber, Vec<u8>>,
+    pager: &'a mut Pager,
     root_pn: PageNumber,
 }
 
 impl<'a> Cursor<'a> {
-    pub fn new(pages: &'a HashMap<PageNumber, Vec<u8>>, root_pn: PageNumber) -> Self {
-        Self { pages, root_pn }
+    pub fn new(pager: &'a mut Pager, root_pn: PageNumber) -> Self {
+        Self { pager, root_pn }
     }
 
-    pub fn seek(&self, row_id: u64) -> anyhow::Result<Option<TableLeafCell>> {
+    pub fn seek(&mut self, row_id: u64) -> anyhow::Result<Option<TableLeafCell>> {
         self.seek_from(self.root_pn, row_id)
     }
 
-    pub fn scan(&self) -> anyhow::Result<Vec<TableLeafCell>> {
+    pub fn scan(&mut self) -> anyhow::Result<Vec<TableLeafCell>> {
         let mut res = Vec::new();
         self.scan_from(self.root_pn, &mut res)?;
         Ok(res)
     }
 
-    fn fetch_page(&self, page_number: PageNumber) -> anyhow::Result<Page> {
-        let page_bytes = match self.pages.get(&page_number) {
-            Some(b) => b,
-            None => anyhow::bail!("no page with page number {page_number}"),
+    fn fetch_page(&mut self, page_number: PageNumber) -> anyhow::Result<Page> {
+        let page_bytes = match self.pager.get_page(page_number) {
+            Ok(b) => b,
+            Err(e) => anyhow::bail!("no page with page number {page_number}: {e}"),
         };
 
         Page::parse(page_bytes, page_number)
     }
 
     fn seek_from(
-        &self,
+        &mut self,
         page_number: PageNumber,
         row_id: u64,
     ) -> anyhow::Result<Option<TableLeafCell>> {
@@ -54,7 +55,7 @@ impl<'a> Cursor<'a> {
     }
 
     fn scan_from(
-        &self,
+        &mut self,
         page_number: PageNumber,
         scanned: &mut Vec<TableLeafCell>,
     ) -> anyhow::Result<()> {
@@ -77,10 +78,20 @@ mod tests {
     use crate::file::pages::interior::{TableInteriorCell, TableInteriorPage};
     use crate::file::pages::leaf::TableLeafPage;
 
-    const PAGE_SIZE: usize = 512;
+    const PAGE_SIZE: u32 = 512;
 
     fn pn(n: u32) -> PageNumber {
         PageNumber::try_from(n).unwrap()
+    }
+
+    fn temp_db_path(tag: &str) -> String {
+        let mut path = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("maze_cursor_test_{tag}_{unique}.mz"));
+        path.to_str().unwrap().to_string()
     }
 
     fn leaf(row_ids: &[u64]) -> TableLeafPage {
@@ -95,11 +106,26 @@ mod tests {
         }
     }
 
-    // Builds this 3-level tree (page numbers deliberately avoid 1, which
-    // carries the file-header offset — irrelevant to what Cursor is tested
-    // on here):
+    fn write_leaf(pager: &mut Pager, page_number: PageNumber, row_ids: &[u64]) {
+        let bytes = Page::TableLeaf(leaf(row_ids))
+            .serialize(page_number, PAGE_SIZE as usize)
+            .unwrap();
+        pager.write_page(page_number, bytes).unwrap();
+    }
+
+    fn write_interior(pager: &mut Pager, page_number: PageNumber, page: TableInteriorPage) {
+        let bytes = Page::TableInterior(page)
+            .serialize(page_number, PAGE_SIZE as usize)
+            .unwrap();
+        pager.write_page(page_number, bytes).unwrap();
+    }
+
+    // Builds this 3-level tree, rooted at page 1 on a real file-backed
+    // Pager -- deliberately exercising the page-1 file-header-offset path
+    // (not sidestepped the way the old HashMap fixture did), since that's
+    // exactly the code path the serialize/parse symmetry fix was about.
     //
-    //                      root (page 2)
+    //                      root (page 1)
     //                 cell: (page 5, key=30)      rightmost: page 6
     //                /                                        \
     //         mid1 (page 5)                              mid2 (page 6)
@@ -107,74 +133,57 @@ mod tests {
     //        /          \                                /            \
     //  leaf 10        leaf 11                        leaf 12        leaf 13
     //  [1,2,3]       [10,20,30]                      [100,150]    [500,600,700]
-    fn build_tree() -> HashMap<PageNumber, Vec<u8>> {
-        let mid1 = TableInteriorPage {
-            cells: vec![TableInteriorCell {
-                left_child: pn(10),
-                row_id: 3,
-            }],
-            rightmost_child: pn(11),
-        };
-        let mid2 = TableInteriorPage {
-            cells: vec![TableInteriorCell {
-                left_child: pn(12),
-                row_id: 150,
-            }],
-            rightmost_child: pn(13),
-        };
-        let root = TableInteriorPage {
-            cells: vec![TableInteriorCell {
-                left_child: pn(5),
-                row_id: 30,
-            }],
-            rightmost_child: pn(6),
-        };
+    fn build_tree(path: &str) -> Pager {
+        let mut pager = Pager::new(path, PAGE_SIZE).unwrap();
 
-        let mut pages = HashMap::new();
-        pages.insert(
-            pn(10),
-            Page::TableLeaf(leaf(&[1, 2, 3]))
-                .serialize(pn(10), PAGE_SIZE)
-                .unwrap(),
-        );
-        pages.insert(
-            pn(11),
-            Page::TableLeaf(leaf(&[10, 20, 30]))
-                .serialize(pn(11), PAGE_SIZE)
-                .unwrap(),
-        );
-        pages.insert(
-            pn(12),
-            Page::TableLeaf(leaf(&[100, 150]))
-                .serialize(pn(12), PAGE_SIZE)
-                .unwrap(),
-        );
-        pages.insert(
-            pn(13),
-            Page::TableLeaf(leaf(&[500, 600, 700]))
-                .serialize(pn(13), PAGE_SIZE)
-                .unwrap(),
-        );
-        pages.insert(
+        write_leaf(&mut pager, pn(10), &[1, 2, 3]);
+        write_leaf(&mut pager, pn(11), &[10, 20, 30]);
+        write_leaf(&mut pager, pn(12), &[100, 150]);
+        write_leaf(&mut pager, pn(13), &[500, 600, 700]);
+
+        write_interior(
+            &mut pager,
             pn(5),
-            Page::TableInterior(mid1).serialize(pn(5), PAGE_SIZE).unwrap(),
+            TableInteriorPage {
+                cells: vec![TableInteriorCell {
+                    left_child: pn(10),
+                    row_id: 3,
+                }],
+                rightmost_child: pn(11),
+            },
         );
-        pages.insert(
+        write_interior(
+            &mut pager,
             pn(6),
-            Page::TableInterior(mid2).serialize(pn(6), PAGE_SIZE).unwrap(),
+            TableInteriorPage {
+                cells: vec![TableInteriorCell {
+                    left_child: pn(12),
+                    row_id: 150,
+                }],
+                rightmost_child: pn(13),
+            },
         );
-        pages.insert(
-            pn(2),
-            Page::TableInterior(root).serialize(pn(7), PAGE_SIZE).unwrap(),
+        // overwrites the empty root leaf `Pager::new` creates at page 1.
+        write_interior(
+            &mut pager,
+            pn(1),
+            TableInteriorPage {
+                cells: vec![TableInteriorCell {
+                    left_child: pn(5),
+                    row_id: 30,
+                }],
+                rightmost_child: pn(6),
+            },
         );
 
-        pages
+        pager
     }
 
     #[test]
     fn seek_finds_every_row_that_exists() {
-        let pages = build_tree();
-        let cursor = Cursor::new(&pages, pn(2));
+        let path = temp_db_path("seek_finds");
+        let mut pager = build_tree(&path);
+        let mut cursor = Cursor::new(&mut pager, pn(1));
 
         for &row_id in &[1u64, 2, 3, 10, 20, 30, 100, 150, 500, 600, 700] {
             let found = cursor.seek(row_id).unwrap();
@@ -184,12 +193,15 @@ mod tests {
                 "expected to find row {row_id}"
             );
         }
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn seek_returns_none_for_rows_that_dont_exist() {
-        let pages = build_tree();
-        let cursor = Cursor::new(&pages, pn(2));
+        let path = temp_db_path("seek_none");
+        let mut pager = build_tree(&path);
+        let mut cursor = Cursor::new(&mut pager, pn(1));
 
         // includes: below everything, between leaves within one subtree,
         // between the two second-level subtrees, and above everything.
@@ -200,12 +212,15 @@ mod tests {
                 "expected row {row_id} to be absent"
             );
         }
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn scan_returns_every_row_in_ascending_order() {
-        let pages = build_tree();
-        let cursor = Cursor::new(&pages, pn(2));
+        let path = temp_db_path("scan_order");
+        let mut pager = build_tree(&path);
+        let mut cursor = Cursor::new(&mut pager, pn(1));
 
         let got: Vec<u64> = cursor
             .scan()
@@ -215,5 +230,7 @@ mod tests {
             .collect();
 
         assert_eq!(got, vec![1, 2, 3, 10, 20, 30, 100, 150, 500, 600, 700]);
+
+        std::fs::remove_file(&path).ok();
     }
 }

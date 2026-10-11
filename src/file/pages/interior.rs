@@ -105,7 +105,7 @@ impl TryFrom<&[u8]> for TableInteriorCell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{header::HEADER_SIZE, pages::Page};
+    use crate::file::{header::MAZE_HEADER_SIZE, pages::Page};
 
     const PAGE_SIZE: usize = 512;
 
@@ -120,7 +120,7 @@ mod tests {
     }
 
     /// Builds a full page buffer with cells packed at the end of the page.
-    /// `base` is 0 for an ordinary page and HEADER_SIZE for page 1.
+    /// `base` is 0 for an ordinary page and MAZE_HEADER_SIZE for page 1.
     /// Returns (buffer, pointers as stored on disk, content offset).
     fn build_interior(
         base: usize,
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn page_enum_dispatches_to_interior() {
         // (page number, base offset): page 1 sits after the file header
-        for (number, base) in [(1u32, HEADER_SIZE), (2, 0)] {
+        for (number, base) in [(1u32, MAZE_HEADER_SIZE), (2, 0)] {
             let (buf, _, _) = build_interior(base, &[(3, 100), (4, 300)], 5);
             match Page::parse(&buf, pn(number)).unwrap() {
                 Page::TableInterior(p) => {

@@ -1,4 +1,4 @@
-pub const HEADER_SIZE: usize = 15;
+pub const MAZE_HEADER_SIZE: usize = 15;
 const MAGIC_STR: &[u8] = b"Maze Format 1\0";
 const HEADER_PAGE_SIZE_OFFSET: usize = 14;
 const MAX_PAGE_SIZE: u32 = (u16::MAX as u32) + 1; // 65536
@@ -10,8 +10,13 @@ pub struct MazeHeader {
 }
 
 impl MazeHeader {
+    pub fn new(page_size: u32) -> anyhow::Result<Self> {
+        let page_size_exp = PageSizeExp::try_from(page_size)?;
+        Ok(Self { page_size_exp })
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(HEADER_SIZE);
+        let mut bytes = Vec::with_capacity(MAZE_HEADER_SIZE);
         bytes.extend_from_slice(MAGIC_STR); // 14 bytes
         bytes.push(self.page_size_exp.get()); // byte 14
         bytes
@@ -44,7 +49,7 @@ impl TryFrom<&[u8]> for MazeHeader {
 #[derive(Debug, Clone, Copy)]
 pub struct PageSizeExp(u8);
 impl PageSizeExp {
-    fn new(val: u8) -> anyhow::Result<Self> {
+    pub fn new(val: u8) -> anyhow::Result<Self> {
         if (9..=16).contains(&val) {
             Ok(Self(val))
         } else {
@@ -52,8 +57,22 @@ impl PageSizeExp {
         }
     }
 
-    fn get(&self) -> u8 {
+    pub fn get(&self) -> u8 {
         self.0
+    }
+}
+
+impl TryFrom<u32> for PageSizeExp {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u32) -> anyhow::Result<Self> {
+        if value > MAX_PAGE_SIZE {
+            anyhow::bail!("invalid page size: too large")
+        } else if !value.is_power_of_two() {
+            anyhow::bail!("invalid page size: not a power of 2")
+        }
+
+        Ok(Self(value.ilog2() as u8))
     }
 }
 
@@ -98,7 +117,7 @@ mod tests {
             page_size_exp: PageSizeExp::new(12).unwrap(),
         };
         let bytes = h.serialize();
-        assert_eq!(bytes.len(), HEADER_SIZE);
+        assert_eq!(bytes.len(), MAZE_HEADER_SIZE);
         assert_eq!(
             MazeHeader::try_from(bytes.as_slice())
                 .unwrap()

@@ -11,7 +11,7 @@ Everything above this layer (records, B-trees) should only ever think in
 terms of "give me page N" / "give me a new page" / "I changed page N" — not
 file handles, not byte offsets, not when exactly a write hits disk. That
 separation is valuable for the same reason any abstraction layer is: it lets
-you change *how* pages are stored (e.g. add caching, add a freelist, add
+you change _how_ pages are stored (e.g. add caching, add a freelist, add
 compression) without touching the B-tree code that just wants `Page`
 objects by number.
 
@@ -20,7 +20,7 @@ flowchart TB
     Exec["Executor / B-tree code"] -->|"get_page(id) / new_page() / mark_dirty(id)"| Pager
     Pager -->|cache hit: return from memory| Cache[("In-memory page cache")]
     Pager -->|cache miss: read N bytes at offset| Disk[("File on disk")]
-    Pager -->|flush(): write dirty pages back| Disk
+    Pager -->|"flush(): write dirty pages back"| Disk
 ```
 
 ## Pages as fixed-size disk blocks
@@ -52,7 +52,7 @@ in memory and only touches disk on a genuine **cache miss**. Writes are
 typically **write-back**, not write-through: a modified page is marked
 **dirty** and kept in memory; it's only actually written to disk later (on
 an explicit flush/checkpoint, or when evicted to make room for another
-page). This is a huge performance win, but it's exactly *why* durability
+page). This is a huge performance win, but it's exactly _why_ durability
 (Subproject 12) is a separate hard problem — "the data looks committed in
 memory" and "the data survived a crash" are different claims once write-back
 caching exists.
@@ -104,7 +104,7 @@ fn open_rw(path: &str) -> std::io::Result<File> {
 }
 ```
 
-- `read_exact` (vs. plain `read`) fails unless it fills the *entire* buffer
+- `read_exact` (vs. plain `read`) fails unless it fills the _entire_ buffer
   — exactly what you want for fixed-size pages; a short read means something
   is wrong (truncated/corrupt file) and should be an error, not silently
   return fewer bytes.
@@ -172,7 +172,7 @@ fn get_page(&mut self, id: u32) -> anyhow::Result<&Vec<u8>> {
 
 If you want `get_page_mut(&mut self, id) -> &mut Vec<u8>` so callers can
 modify a page in place, you'll notice the borrow checker ties the returned
-`&mut Vec<u8>` to the *entire* `&mut self` borrow of the `Pager` for as long
+`&mut Vec<u8>` to the _entire_ `&mut self` borrow of the `Pager` for as long
 as that reference lives — meaning you can't call another `&mut self` method
 on the pager (like allocating a new page) while still holding onto a
 previous page's `&mut` reference. This is Rust correctly preventing a real
@@ -180,7 +180,7 @@ bug class (two live mutable aliases into the same cache that could
 invalidate each other, e.g. if `allocate_page` had to resize/rehash the
 `HashMap`) — but it does mean you may need to restructure call sites to
 "get page, extract what you need or finish mutating it, drop the reference,
-*then* get the next page" rather than holding several page references open
+_then_ get the next page" rather than holding several page references open
 simultaneously across a complex operation (this will matter concretely in
 Subproject 5's split logic, which conceptually touches a leaf and its new
 sibling and its parent "at once"). The usual fix is to fetch one page,
@@ -191,7 +191,7 @@ move on to the next — sequential borrows instead of overlapping ones.
 
 It's tempting to sidestep borrow-checker friction with shared,
 reference-counted, runtime-checked mutable cells (`Rc<RefCell<T>>`), and
-occasionally that's the pragmatic choice. But for a *learning* project, the
+occasionally that's the pragmatic choice. But for a _learning_ project, the
 borrow checker's complaints here are pointing at a real design question
 ("can two parts of my code validly hold onto two different pages' mutable
 state at once, and in what order do operations need to happen") that's
@@ -210,7 +210,7 @@ fn temp_db_path(test_name: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    path.push(format!("maze_test_{test_name}_{unique}.db"));
+    path.push(format!("maze_test_{test_name}_{unique}.mz"));
     path
 }
 ```

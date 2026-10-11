@@ -7,7 +7,7 @@ pub mod types;
 mod bytes;
 
 use crate::file::{
-    header::HEADER_SIZE,
+    header::MAZE_HEADER_SIZE,
     pages::{
         cell::Cell, header::PageHeader, interior::TableInteriorPage, leaf::TableLeafPage,
         types::PageNumber,
@@ -22,7 +22,11 @@ pub enum Page {
 
 impl Page {
     pub fn parse(mut buf: &[u8], page_number: PageNumber) -> anyhow::Result<Page> {
-        let data_offset = if page_number == 1 { HEADER_SIZE } else { 0 };
+        let data_offset = if page_number == 1 {
+            MAZE_HEADER_SIZE
+        } else {
+            0
+        };
 
         buf = buf
             .get(data_offset..)
@@ -91,7 +95,7 @@ impl PageType {
             _ => {}
         }
         let page_offset = match page_number.get() {
-            1 => HEADER_SIZE,
+            1 => MAZE_HEADER_SIZE,
             _ => 0,
         };
 
@@ -118,7 +122,7 @@ impl PageType {
             .checked_sub(all_cells_len)
             .filter(|&offset| offset >= cell_ptrs_region_end) // only get the calculated offset if it is greater than the last cell pointer's address
             .ok_or_else(|| anyhow::anyhow!("cells do not fit in page"))?;
-        // in the case of a new table with page size = 65536, then all_cells_len = 0, therefore cell_content_offset = 65536.
+        // an empty page can only hit exactly page_size here when page_offset == 0 (i.e. not page 1) — page 1's relative offset is always < page_size
         let stored_cell_content_offset = if cell_content_offset == 65536 {
             0
         } else {
@@ -140,7 +144,7 @@ impl PageType {
             // Copy the cell, at its real (absolute) position in the buffer.
             let abs_cell_start = page_offset + cell_ptr;
             p_buf[abs_cell_start..abs_cell_start + cell.len()].copy_from_slice(cell);
-            
+
             let cell_ptr_addr = page_offset + header_size + 2 * i;
             p_buf[cell_ptr_addr..cell_ptr_addr + 2]
                 .copy_from_slice(&u16::try_from(cell_ptr)?.to_be_bytes());
@@ -151,7 +155,7 @@ impl PageType {
         Ok(p_buf)
     }
 
-    fn header_size(&self) -> usize {
+    pub fn header_size(&self) -> usize {
         match self {
             PageType::TableLeaf => 5,
             PageType::TableInterior => 9,
@@ -184,7 +188,7 @@ impl TryFrom<u8> for PageType {
 mod tests {
     use super::*;
     use crate::file::{
-        header::HEADER_SIZE,
+        header::MAZE_HEADER_SIZE,
         pages::{
             interior::{TableInteriorCell, TableInteriorPage},
             leaf::TableLeafCell,
@@ -205,7 +209,7 @@ mod tests {
         const PAGE_SIZE: usize = 512;
         // Page 1: the leaf page starts right after the file header, and (as in your
         // original test) pointers and the content offset are relative to that start.
-        let base = HEADER_SIZE;
+        let base = MAZE_HEADER_SIZE;
         let leaf_len = PAGE_SIZE - base;
 
         // Mix of 1-byte and multi-byte varints: len 3 / id 1, and len 200 / id 300
@@ -277,7 +281,10 @@ mod tests {
 
         // The file-header region must stay untouched by page-serialization
         // code — only the Pager/MazeHeader should ever write there.
-        assert_eq!(&bytes[0..HEADER_SIZE], vec![0u8; HEADER_SIZE].as_slice());
+        assert_eq!(
+            &bytes[0..MAZE_HEADER_SIZE],
+            vec![0u8; MAZE_HEADER_SIZE].as_slice()
+        );
 
         match Page::parse(&bytes, pn1).unwrap() {
             Page::TableLeaf(parsed) => assert_eq!(parsed, original),
@@ -302,7 +309,10 @@ mod tests {
             .serialize(pn1, PAGE_SIZE)
             .unwrap();
 
-        assert_eq!(&bytes[0..HEADER_SIZE], vec![0u8; HEADER_SIZE].as_slice());
+        assert_eq!(
+            &bytes[0..MAZE_HEADER_SIZE],
+            vec![0u8; MAZE_HEADER_SIZE].as_slice()
+        );
 
         match Page::parse(&bytes, pn1).unwrap() {
             Page::TableInterior(parsed) => assert_eq!(parsed, original),
