@@ -1,5 +1,8 @@
 use crate::file::{
-    pages::{PageType, pack_page, parse_cell_ptrs, parse_header},
+    pages::{
+        PageHeader, PageType,
+        cell::{Cell, parse_cells},
+    },
     record::{Record, Value},
     varint,
 };
@@ -11,18 +14,8 @@ pub struct TableLeafPage {
 
 impl TableLeafPage {
     pub fn serialize(&self, usable_page_len: usize) -> anyhow::Result<Vec<u8>> {
-        let cells: Vec<Vec<u8>> = self
-            .cells
-            .iter()
-            .map(|cell| cell.serialize())
-            .collect::<Vec<Vec<u8>>>();
         let no_rightmost_child = None;
-        pack_page(
-            PageType::TableLeaf,
-            no_rightmost_child,
-            &cells,
-            usable_page_len,
-        )
+        PageType::TableLeaf.serialize(no_rightmost_child, &self.cells, usable_page_len)
     }
 }
 
@@ -30,71 +23,8 @@ impl TryFrom<&[u8]> for TableLeafPage {
     type Error = anyhow::Error;
 
     fn try_from(buf: &[u8]) -> anyhow::Result<Self> {
-        let header = parse_header(buf, PageType::TableLeaf)?;
-
-        let cell_content_region_start = match header.cell_content_offset {
-            0 => 65536usize,
-            n => n as usize,
-        };
-        let cell_ptr_region_end =
-            PageType::TableLeaf.header_size() + 2 * header.cell_count as usize;
-
-        if cell_ptr_region_end > cell_content_region_start || cell_content_region_start > buf.len()
-        {
-            anyhow::bail!("invalid cell content offset")
-        }
-
-        let content_buffer = buf
-            .get(PageType::TableLeaf.header_size()..)
-            .ok_or_else(|| anyhow::anyhow!("leaf page smaller than leaf page header"))?;
-        let cell_ptrs = parse_cell_ptrs(content_buffer, header.cell_count as usize)?;
-
-        let mut prev_row_id: Option<u64> = None;
-        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(cell_ptrs.len());
-
-        let cells = cell_ptrs
-            .iter()
-            .map(|&ptr| {
-                // If a cell pointer points anywhere other than the cell area of the page, then error out.
-                if (ptr as usize) < cell_content_region_start {
-                    anyhow::bail!(
-                        "invalid cell pointer {ptr}: points outside the designated cell content region"
-                    )
-                }
-
-                let ptr_usize = ptr as usize;
-                let res = TableLeafCell::try_from(
-                    buf.get(ptr_usize..)
-                        .ok_or_else(|| anyhow::anyhow!("cell out of bounds"))?,
-                )?;
-                let len = res.encoded_len();
-                let end = ptr_usize
-                    .checked_add(len)
-                    .ok_or_else(|| anyhow::anyhow!("cell end overflows"))?;
-                if end > buf.len() {
-                    anyhow::bail!("cell extends past end of page");
-                }
-                spans.push((ptr_usize, end));
-
-                if let Some(prev) = prev_row_id {
-                    if res.row_id <= prev {
-                        anyhow::bail!("cell pointers not sorted by row_id")
-                    }
-                }
-                prev_row_id = Some(res.row_id);
-
-                Ok(res)
-            })
-            .collect::<anyhow::Result<Vec<TableLeafCell>>>()?;
-
-        // Cells may be in key order, not physical order — sort by offset to
-        // detect overlaps/aliasing (e.g. a pointer into another cell's payload).
-        spans.sort_by_key(|&(start, _)| start);
-        for w in spans.windows(2) {
-            if w[1].0 < w[0].1 {
-                anyhow::bail!("corrupted buffer: overlapping cells");
-            }
-        }
+        let header = PageHeader::parse(buf, PageType::TableLeaf)?;
+        let cells = parse_cells(buf, header, PageType::TableLeaf)?;
 
         Ok(Self { cells })
     }
@@ -106,23 +36,29 @@ pub struct TableLeafCell {
     pub payload: Vec<u8>,
 }
 
-impl TableLeafCell {
-    pub fn serialize(&self) -> Vec<u8> {
+impl Cell for TableLeafCell {
+    fn serialize(&self) -> Vec<u8> {
         let mut bytes = varint::encode(self.payload.len() as u64);
         bytes.extend(varint::encode(self.row_id));
         bytes.extend_from_slice(&self.payload);
         bytes
     }
 
-    pub fn decode_payload(&self) -> anyhow::Result<Vec<Value>> {
-        let record = Record::build(&self.payload)?;
-        Ok(record.body)
-    }
-
-    pub fn encoded_len(&self) -> usize {
+    fn encoded_len(&self) -> usize {
         varint::encode(self.payload.len() as u64).len()
             + varint::encode(self.row_id).len()
             + self.payload.len()
+    }
+
+    fn sort_key(&self) -> u64 {
+        self.row_id
+    }
+}
+
+impl TableLeafCell {
+    pub fn decode_payload(&self) -> anyhow::Result<Vec<Value>> {
+        let record = Record::build(&self.payload)?;
+        Ok(record.body)
     }
 }
 
@@ -235,7 +171,7 @@ mod tests {
             buf[o..o + 2].copy_from_slice(&p.to_be_bytes());
         }
 
-        let page_number = PageNumber(1);
+        let page_number = PageNumber::try_from(1).unwrap();
         let page = Page::parse(&buf, page_number).unwrap();
         if let Page::TableLeaf(leaf) = page {
             assert_eq!(leaf.cells.len(), rows.len());

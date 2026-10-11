@@ -23,7 +23,7 @@ impl TryFrom<&[u8]> for MazeHeader {
 
     fn try_from(buf: &[u8]) -> anyhow::Result<Self> {
         if !buf.starts_with(MAGIC_STR) {
-            let prefix = String::from_utf8_lossy(&buf.get(..MAGIC_STR.len()).ok_or_else(|| {
+            let prefix = String::from_utf8_lossy(buf.get(..MAGIC_STR.len()).ok_or_else(|| {
                 anyhow::anyhow!("db file is smaller than magic string itself bro how tf")
             })?);
             anyhow::bail!("invalid magic string: {prefix}");

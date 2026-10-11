@@ -1,34 +1,18 @@
 pub mod interior;
 pub mod leaf;
+pub mod types;
+pub mod cell;
+pub mod header;
 
 mod bytes;
 
 use crate::file::{
     header::HEADER_SIZE,
     pages::{
-        bytes::{read_word_u16_be, read_word_u32_be},
-        interior::TableInteriorPage,
-        leaf::TableLeafPage,
+        cell::Cell, header::PageHeader, interior::TableInteriorPage, leaf::TableLeafPage,
+        types::PageNumber,
     },
 };
-
-const PAGE_CELL_COUNT_OFFSET: usize = 1;
-const PAGE_CELL_CONTENT_OFFSET: usize = 3;
-const PAGE_RIGHTMOST_CHILD_OFFSET: usize = 5;
-
-/*
-    PageHeader size:
-        Leaf Node = 1 + 2 + 2 + 0 = 5
-        Interior = 1 + 2 + 2 + 4 = 9
-*/
-// Internal struct, only holds metadata for as long as i need it.
-#[derive(Debug, Copy, Clone)]
-pub(crate) struct PageHeader {
-    pub(crate) page_type: PageType,
-    pub(crate) cell_count: u16,
-    pub(crate) cell_content_offset: u16, // 0 => 65536, else same
-    pub(crate) rightmost_child: Option<PageNumber>, // Only interior page has this field set to Some().
-}
 
 #[derive(Debug, Clone)]
 pub enum Page {
@@ -64,15 +48,95 @@ impl Page {
             Page::TableInterior(ip) => ip.serialize(usable_page_len),
         }
     }
+
+    // fn parse_page(buf: &[u8]) ->
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
-pub enum PageType {
+pub(crate) enum PageType {
     TableLeaf,
     TableInterior,
 }
 
 impl PageType {
+    pub(crate) fn serialize<C: Cell>(
+        &self,
+        rightmost_child: Option<PageNumber>,
+        cells: &[C],
+        usable_page_len: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        let cells_bytes = cells
+            .iter()
+            .map(|c| c.serialize())
+            .collect::<Vec<Vec<u8>>>();
+
+        self.pack(rightmost_child, &cells_bytes, usable_page_len)
+    }
+
+    fn pack(
+        self,
+        rightmost_child: Option<PageNumber>,
+        cells: &[Vec<u8>],
+        usable_page_len: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        match self {
+            PageType::TableInterior if rightmost_child.is_none() => {
+                anyhow::bail!("interior page has no rightmost child")
+            }
+            PageType::TableLeaf if let Some(_) = rightmost_child => {
+                anyhow::bail!("how tf does leaf page have a rightmost child bro?")
+            }
+            _ => {}
+        }
+
+        let mut p_buf = vec![0u8; usable_page_len];
+
+        /*
+            A page's header contains:
+                1. page type
+                2. cell count,
+                3. cell content offset and
+                4. rightmost child page number
+        */
+        let header_size = self.header_size();
+        let all_cells_len: usize = cells.iter().map(Vec::len).sum();
+        let cell_count = cells.len();
+        let cell_ptrs_region_end = header_size + 2 * cell_count;
+        let cell_content_offset = usable_page_len
+            .checked_sub(all_cells_len)
+            .filter(|&offset| offset >= cell_ptrs_region_end) // only get the calculated offset if it is greater than the last cell pointer's address
+            .ok_or_else(|| anyhow::anyhow!("cells do not fit in page"))?;
+        // in the case of a new table with page size = 65536, then all_cells_len = 0, therefore cell_content_offset = 65536.
+        let stored_cell_content_offset = if cell_content_offset == 65536 {
+            0
+        } else {
+            cell_content_offset as u16
+        };
+
+        // Writing the page header.
+        p_buf[0] = self.into();
+        p_buf[1..3].copy_from_slice(&u16::try_from(cell_count)?.to_be_bytes());
+        p_buf[3..5].copy_from_slice(&stored_cell_content_offset.to_be_bytes());
+        if let Some(rc) = rightmost_child {
+            p_buf[5..9].copy_from_slice(&rc.get().to_be_bytes());
+        }
+
+        // Writing cell pointers and cells simultaneously.
+        let mut cell_ptr = cell_content_offset;
+        for (i, cell) in cells.iter().enumerate() {
+            // Copy the cell.
+            p_buf[cell_ptr..cell_ptr + cell.len()].copy_from_slice(cell);
+            // Copy its pointer.
+            let cell_ptr_addr = header_size + 2 * i;
+            p_buf[cell_ptr_addr..cell_ptr_addr + 2]
+                .copy_from_slice(&u16::try_from(cell_ptr)?.to_be_bytes());
+            // Advance the pointer, this avoids fragmentation, ie, gaps between cells.
+            cell_ptr += cell.len()
+        }
+
+        Ok(p_buf)
+    }
+
     fn header_size(&self) -> usize {
         match self {
             PageType::TableLeaf => 5,
@@ -100,134 +164,6 @@ impl TryFrom<u8> for PageType {
             _ => anyhow::bail!("invalid page type"),
         }
     }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct PageNumber(u32);
-impl PageNumber {
-    pub fn get(&self) -> u32 {
-        self.0
-    }
-}
-
-impl TryFrom<u32> for PageNumber {
-    type Error = anyhow::Error;
-
-    fn try_from(raw: u32) -> anyhow::Result<Self> {
-        match raw {
-            0 => anyhow::bail!("page number cannot be 0"),
-            n => Ok(Self(n)),
-        }
-    }
-}
-
-impl PartialEq<u32> for PageNumber {
-    fn eq(&self, other: &u32) -> bool {
-        self.0 == *other
-    }
-}
-
-pub(crate) fn parse_header(buf: &[u8], page_type: PageType) -> anyhow::Result<PageHeader> {
-    if buf.is_empty() {
-        anyhow::bail!("buffer is empty")
-    }
-
-    if PageType::try_from(buf[0])? != page_type {
-        anyhow::bail!("invalid page_type args")
-    }
-
-    let cell_count = read_word_u16_be(buf, PAGE_CELL_COUNT_OFFSET)?;
-    let cell_content_offset = read_word_u16_be(buf, PAGE_CELL_CONTENT_OFFSET)?;
-    let rightmost_child = match page_type {
-        PageType::TableInterior => Some(PageNumber::try_from(read_word_u32_be(
-            buf,
-            PAGE_RIGHTMOST_CHILD_OFFSET,
-        )?)?),
-        PageType::TableLeaf => None,
-    };
-
-    Ok(PageHeader {
-        page_type: page_type,
-        cell_count,
-        cell_content_offset,
-        rightmost_child,
-    })
-}
-
-pub(crate) fn parse_cell_ptrs(buf: &[u8], cell_count: usize) -> anyhow::Result<Vec<u16>> {
-    let mut pointers = Vec::with_capacity(cell_count);
-
-    for i in 0..cell_count {
-        let bytes = read_word_u16_be(buf, 2 * i)
-            .map_err(|_| anyhow::anyhow!("failed to parse cell pointers at index {i}"))?;
-        pointers.push(bytes);
-    }
-
-    Ok(pointers)
-}
-
-pub(crate) fn pack_page(
-    page_type: PageType,
-    rightmost_child: Option<PageNumber>,
-    cells: &[Vec<u8>],
-    usable_page_len: usize,
-) -> anyhow::Result<Vec<u8>> {
-    match page_type {
-        PageType::TableInterior if rightmost_child.is_none() => {
-            anyhow::bail!("interior page has no rightmost child")
-        }
-        PageType::TableLeaf if let Some(_) = rightmost_child => {
-            anyhow::bail!("how tf does leaf page have a rightmost child bro?")
-        }
-        _ => {}
-    }
-
-    let mut p_buf = vec![0u8; usable_page_len];
-
-    /*
-        A page's header contains:
-            1. page type
-            2. cell count,
-            3. cell content offset and
-            4. rightmost child page number
-    */
-    let header_size = page_type.header_size();
-    let all_cells_len: usize = cells.iter().map(Vec::len).sum();
-    let cell_count = cells.len();
-    let cell_ptrs_region_end = header_size + 2 * cell_count;
-    let cell_content_offset = usable_page_len
-        .checked_sub(all_cells_len)
-        .filter(|&offset| offset >= cell_ptrs_region_end) // only get the calculated offset if it is greater than the last cell pointer's address
-        .ok_or_else(|| anyhow::anyhow!("cells do not fit in page"))?;
-    // in the case of a new table with page size = 65536, then all_cells_len = 0, therefore cell_content_offset = 65536.
-    let stored_cell_content_offset = if cell_content_offset == 65536 {
-        0
-    } else {
-        cell_content_offset as u16
-    };
-
-    // Writing the page header.
-    p_buf[0] = page_type.into();
-    p_buf[1..3].copy_from_slice(&u16::try_from(cell_count)?.to_be_bytes());
-    p_buf[3..5].copy_from_slice(&stored_cell_content_offset.to_be_bytes());
-    if let Some(rc) = rightmost_child {
-        p_buf[5..9].copy_from_slice(&rc.get().to_be_bytes());
-    }
-
-    // Writing cell pointers and cells simultaneously.
-    let mut cell_ptr = cell_content_offset;
-    for (i, cell) in cells.iter().enumerate() {
-        // Copy the cell.
-        p_buf[cell_ptr..cell_ptr + cell.len()].copy_from_slice(cell);
-        // Copy its pointer.
-        let cell_ptr_addr = header_size + 2 * i;
-        p_buf[cell_ptr_addr..cell_ptr_addr + 2]
-            .copy_from_slice(&u16::try_from(cell_ptr)?.to_be_bytes());
-        // Advance the pointer, this avoids fragmentation, ie, gaps between cells.
-        cell_ptr += cell.len()
-    }
-
-    Ok(p_buf)
 }
 
 #[cfg(test)]
@@ -278,7 +214,7 @@ mod tests {
             buf[o..o + 2].copy_from_slice(&p.to_be_bytes());
         }
 
-        let page = Page::parse(&buf, PageNumber(1)).unwrap();
+        let page = Page::parse(&buf, PageNumber::try_from(1).unwrap()).unwrap();
         if let Page::TableLeaf(leaf) = page {
             assert_eq!(leaf.cells.len(), rows.len());
             for (cell, (id, payload)) in leaf.cells.iter().zip(&rows) {

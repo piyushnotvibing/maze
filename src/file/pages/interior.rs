@@ -16,9 +16,7 @@
 */
 
 use crate::file::{
-    pages::{
-        PageNumber, PageType, bytes::read_word_u32_be, pack_page, parse_cell_ptrs, parse_header,
-    },
+    pages::{Cell, PageHeader, PageNumber, PageType, bytes::read_word_u32_be, cell::parse_cells},
     varint,
 };
 
@@ -32,26 +30,15 @@ impl TableInteriorPage {
     pub fn serialize(&self, usable_page_len: usize) -> anyhow::Result<Vec<u8>> {
         let mut prev_row_id: Option<u64> = None;
         for cell in self.cells.iter() {
-            if let Some(prev_row_id) = prev_row_id {
-                if cell.row_id <= prev_row_id {
-                    anyhow::bail!("interior page cells not in sorted order")
-                }
+            if let Some(prev_row_id) = prev_row_id
+                && cell.row_id <= prev_row_id
+            {
+                anyhow::bail!("interior page cells not in sorted order")
             }
             prev_row_id = Some(cell.row_id);
         }
 
-        let cells: Vec<Vec<u8>> = self
-            .cells
-            .iter()
-            .map(|cell| cell.serialize())
-            .collect::<Vec<Vec<u8>>>();
-
-        pack_page(
-            PageType::TableInterior,
-            Some(self.rightmost_child),
-            &cells,
-            usable_page_len,
-        )
+        PageType::TableInterior.serialize(Some(self.rightmost_child), &self.cells, usable_page_len)
     }
 }
 
@@ -59,7 +46,7 @@ impl TryFrom<&[u8]> for TableInteriorPage {
     type Error = anyhow::Error;
 
     fn try_from(buf: &[u8]) -> anyhow::Result<Self> {
-        let header = parse_header(buf, PageType::TableInterior)?;
+        let header = PageHeader::parse(buf, PageType::TableInterior)?;
         if header.cell_count == 0 {
             anyhow::bail!("interior page has no cells")
         }
@@ -67,67 +54,7 @@ impl TryFrom<&[u8]> for TableInteriorPage {
             anyhow::bail!("interior page has no rightmost child")
         }
 
-        let cell_content_region_start = match header.cell_content_offset {
-            0 => 65536usize,
-            n => n as usize,
-        };
-        let cell_ptr_region_end =
-            PageType::TableInterior.header_size() + 2 * header.cell_count as usize;
-
-        if cell_ptr_region_end > cell_content_region_start || cell_content_region_start > buf.len()
-        {
-            anyhow::bail!("invalid cell content offset")
-        }
-
-        let content_buffer = buf
-            .get(PageType::TableInterior.header_size()..)
-            .ok_or_else(|| anyhow::anyhow!("interior page smaller than interior page header"))?;
-        let cell_ptrs = parse_cell_ptrs(content_buffer, header.cell_count as usize)?;
-
-        let mut prev_row_id: Option<u64> = None;
-        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(cell_ptrs.len());
-        let cells = cell_ptrs
-            .iter()
-            .map(|&ptr| {
-                // If a cell pointer points anywhere other than the cell area of the page, then error out.
-                if (ptr as usize) < cell_content_region_start {
-                    anyhow::bail!(
-                        "invalid cell pointer {ptr}: points outside the designated cell content region"
-                    )
-                }
-
-                let ptr_usize = ptr as usize;
-                let res = TableInteriorCell::try_from(
-                    buf.get(ptr_usize..)
-                        .ok_or_else(|| anyhow::anyhow!("cell out of bounds"))?,
-                )?;
-                let end = ptr_usize
-                    .checked_add(res.encoded_len())
-                    .ok_or_else(|| anyhow::anyhow!("cell end overflows"))?;
-                if end > buf.len() {
-                    anyhow::bail!("cell extends past end of page");
-                }
-                spans.push((ptr_usize, end));
-
-                if let Some(prev) = prev_row_id {
-                    if res.row_id <= prev {
-                        anyhow::bail!("cell pointers not sorted by row_id")
-                    }
-                }
-                prev_row_id = Some(res.row_id);
-
-                Ok(res)
-            })
-            .collect::<anyhow::Result<Vec<TableInteriorCell>>>()?;
-
-        // Pointer order is key order, not physical order — sort by offset to
-        // detect overlaps/aliasing.
-        spans.sort_by_key(|&(start, _)| start);
-        for w in spans.windows(2) {
-            if w[1].0 < w[0].1 {
-                anyhow::bail!("corrupted buffer: overlapping cells");
-            }
-        }
+        let cells = parse_cells(buf, header, PageType::TableInterior)?;
 
         Ok(Self {
             cells,
@@ -145,16 +72,20 @@ pub struct TableInteriorCell {
     pub row_id: u64,
 }
 
-impl TableInteriorCell {
-    pub fn serialize(&self) -> Vec<u8> {
+impl Cell for TableInteriorCell {
+    fn serialize(&self) -> Vec<u8> {
         let mut bytes = self.left_child.get().to_be_bytes().to_vec();
         bytes.extend_from_slice(&varint::encode(self.row_id));
 
         bytes
     }
 
-    pub fn encoded_len(&self) -> usize {
+    fn encoded_len(&self) -> usize {
         std::mem::size_of::<u32>() + varint::encode(self.row_id).len()
+    }
+
+    fn sort_key(&self) -> u64 {
+        self.row_id
     }
 }
 

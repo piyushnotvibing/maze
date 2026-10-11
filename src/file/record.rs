@@ -78,12 +78,12 @@ impl DataType {
             DataType::Int => Ok(6),
             DataType::Float => Ok(7),
             DataType::Blob(blob_len) => 2u64
-                .checked_mul(*blob_len as u64)
+                .checked_mul(*blob_len)
                 .ok_or_else(|| anyhow::anyhow!("blob size too big for u64"))?
                 .checked_add(12)
                 .ok_or_else(|| anyhow::anyhow!("blob size too big for u64")),
             DataType::Text(text_len) => 2u64
-                .checked_mul(*text_len as u64)
+                .checked_mul(*text_len)
                 .ok_or_else(|| anyhow::anyhow!("text size too big for u64"))?
                 .checked_add(13)
                 .ok_or_else(|| anyhow::anyhow!("text size too big for u64")),
