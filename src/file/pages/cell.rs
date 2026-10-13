@@ -29,25 +29,25 @@ pub(crate) fn parse_cells<'a, C: Cell + TryFrom<&'a [u8], Error = anyhow::Error>
     let cells = cell_ptrs
         .iter()
         .map(|&ptr| {
+            let ptr = ptr as usize;
             // If a cell pointer points anywhere other than the cell area of the page, then error out.
-            if (ptr as usize) < cell_content_region_start {
+            if ptr < cell_content_region_start {
                 anyhow::bail!(
                     "invalid cell pointer {ptr}: points outside the designated cell content region"
                 )
             }
 
-            let ptr_usize = ptr as usize;
             let res = C::try_from(
-                buf.get(ptr_usize..)
+                buf.get(ptr..)
                     .ok_or_else(|| anyhow::anyhow!("cell out of bounds"))?,
             )?;
-            let end = ptr_usize
+            let end = ptr
                 .checked_add(res.encoded_len())
                 .ok_or_else(|| anyhow::anyhow!("cell end overflows"))?;
             if end > buf.len() {
                 anyhow::bail!("cell extends past end of page");
             }
-            spans.push((ptr_usize, end));
+            spans.push((ptr, end));
 
             if let Some(prev) = prev_row_id
                 && res.sort_key() <= prev

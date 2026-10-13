@@ -52,8 +52,6 @@ impl Page {
             Page::TableInterior(ip) => ip.serialize(page_number, page_size),
         }
     }
-
-    // fn parse_page(buf: &[u8]) ->
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]

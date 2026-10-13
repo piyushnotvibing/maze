@@ -18,11 +18,11 @@ B+trees, indexing, query execution, and transactions.
 
 ## Master Checklist
 
-- [ ] Subproject 0 — Baseline hygiene
-- [ ] Subproject 1 — Fix & solidify the storage format foundation
-- [ ] Subproject 2 — Record format (the "row" encoding)
-- [ ] Subproject 3 — B-tree read path (interior pages + traversal)
-- [ ] Subproject 4 — Pager / buffer pool
+- [x] Subproject 0 — Baseline hygiene
+- [x] Subproject 1 — Fix & solidify the storage format foundation
+- [x] Subproject 2 — Record format (the "row" encoding)
+- [x] Subproject 3 — B-tree read path (interior pages + traversal)
+- [x] Subproject 4 — Pager / buffer pool
 - [ ] Subproject 5 — B-tree write path: insert & split
 - [ ] Subproject 6 — Delete & rebalancing (simplified)
 - [ ] Subproject 7 — Freelist & overflow pages
@@ -46,16 +46,16 @@ internally consistent and testable.
 
 **Checklist**
 
-- [ ] Reconcile `FILE.md`'s documented page-size-byte offset (14) with
+- [x] Reconcile `FILE.md`'s documented page-size-byte offset (14) with
       `header.rs::HEADER_PAGE_SIZE_OFFSET` (currently 16) — decide which is
       correct and fix the other.
-- [ ] Re-derive and document `MAZE_HEADER_SIZE` (currently a bare `23` with no
+- [x] Re-derive and document `MAZE_HEADER_SIZE` (currently a bare `23` with no
       justification in `FILE.md` or in a comment).
-- [ ] Add a `tests/` directory (integration tests) alongside the existing
+- [x] Add a `tests/` directory (integration tests) alongside the existing
       inline unit tests.
-- [ ] Add `cargo fmt` and `cargo clippy --all-targets` to your personal dev
+- [x] Add `cargo fmt` and `cargo clippy --all-targets` to your personal dev
       loop (run them before every commit).
-- [ ] Commit this as its own "chore: baseline hygiene" commit before moving on.
+- [x] Commit this as its own "chore: baseline hygiene" commit before moving on.
 
 **Definition of done:** `cargo build`, `cargo test`, and `cargo clippy` all
 run clean, and `FILE.md` matches the code exactly for every offset it
@@ -73,26 +73,26 @@ built on top of it.
 
 **Checklist**
 
-- [ ] Write `varint::encode(u64) -> Vec<u8>` and `varint::decode(&[u8]) ->
+- [x] Write `varint::encode(u64) -> Vec<u8>` and `varint::decode(&[u8]) ->
     (u64, usize)` implementing SQLite-style variable-length integers
       (1–8 bytes each contributing 7 bits with a continuation bit, 9th byte
       special-cased to contribute a full 8 bits). Write round-trip property
       tests (`encode` then `decode` recovers the original value) across the
       value space, including edge values (0, 2^7-1, 2^7, u64::MAX).
-  - [ ] Replace `TableLeafCell`'s fixed 8-byte `size`/`row_id` reads
+  - [x] Replace `TableLeafCell`'s fixed 8-byte `size`/`row_id` reads
         (`read_word_u64_be`) with varint reads. Update `parse_table_leaf_cell`
         accordingly.
-- [ ] Fix `parse_table_leaf_page`'s content-buffer bug: it always slices at
+- [x] Fix `parse_table_leaf_page`'s content-buffer bug: it always slices at
       `LEAF_PAGE_HEADER_SIZE`, ignoring `leaf_data_offset` on the first page.
       Make the first page (which has the 23-byte file header in front of its
       page header) compute the cell-pointer array's start correctly.
-- [ ] Remove the redundant re-parse of `page_type` inside
+- [x] Remove the redundant re-parse of `page_type` inside
       `parse_page_header` (the caller already knows it).
-- [ ] Write a hand-built "golden file" test: construct the exact bytes of a
+- [x] Write a hand-built "golden file" test: construct the exact bytes of a
       single-page database with a header + a few leaf cells by hand in a
       test function, parse it, and assert the resulting `Page`/`HeaderInfo`
       match what you encoded.
-- [ ] Write a symmetric serializer: `HeaderInfo::serialize()` and a page
+- [x] Write a symmetric serializer: `HeaderInfo::serialize()` and a page
       serializer for `TableLeafPage`, so you can round-trip
       bytes → struct → bytes and assert equality. (You don't have a pager
       yet — these just operate on `Vec<u8>`/`&mut [u8]` for now.)
@@ -114,17 +114,17 @@ cells sit on a page."
 
 **Checklist**
 
-- [ ] Define a `Value` enum for the column types you'll support to start:
+- [x] Define a `Value` enum for the column types you'll support to start:
       `Null`, `Int(i64)` (pick one or a few widths), `Float(f64)`,
       `Text(String)`, `Blob(Vec<u8>)`.
-- [ ] Define "serial type" codes (a small fixed enum/const table mapping a
+- [x] Define "serial type" codes (a small fixed enum/const table mapping a
       serial type number to a value's on-disk width/representation) and a
       varint-encoded header: `[header length varint][serial type varints...]`
       followed by the body: the concatenated values in order.
-- [ ] Write `Record::encode(&[Value]) -> Vec<u8>` and
+- [x] Write `Record::encode(&[Value]) -> Vec<u8>` and
       `Record::decode(&[u8]) -> anyhow::Result<Vec<Value>>`.
-- [ ] Round-trip unit tests per type, and a mixed-type row test.
-- [ ] Wire `TableLeafCell.payload` to be interpreted as a `Record` (add a
+- [x] Round-trip unit tests per type, and a mixed-type row test.
+- [x] Wire `TableLeafCell.payload` to be interpreted as a `Record` (add a
       `cell.decode_record() -> anyhow::Result<Vec<Value>>` helper, or store
       the decoded form directly — your call, but keep the raw bytes
       available too since Subproject 7 needs to relocate payloads untouched).
@@ -144,22 +144,22 @@ the original values back out.
 
 **Checklist**
 
-- [ ] Implement `PageType::TableInterior` parsing (currently `todo!()` in
+- [x] Implement `PageType::TableInterior` parsing (currently `todo!()` in
       `parse_page`): a list of `(child_page_number, max_row_id_in_subtree)`
       cells plus the existing `rightmost_child` pointer.
-- [ ] Add a `TableInteriorCell` type and a `TableInteriorPage` variant to
+- [x] Add a `TableInteriorCell` type and a `TableInteriorPage` variant to
       the `Page` enum.
-- [ ] Create `src/btree/mod.rs` with a `Cursor` type that, given a root page
+- [x] Create `src/btree/mod.rs` with a `Cursor` type that, given a root page
       number and a `row_id`, walks down through interior pages (binary- or
       linear-searching separator keys) to the correct leaf.
-- [ ] Implement `Cursor::seek(row_id) -> Option<&TableLeafCell>` (point
+- [x] Implement `Cursor::seek(row_id) -> Option<&TableLeafCell>` (point
       lookup).
-- [ ] Implement `Cursor::iter()` — an iterator that walks every leaf cell
+- [x] Implement `Cursor::iter()` — an iterator that walks every leaf cell
       in row-id order across multiple leaf pages (you'll need some way to
       move "next leaf" — either via parent back-links you track during
       descent, or by re-descending from the root for the next key; pick the
       simpler one now and note it as a simplification).
-- [ ] Hand-build a 3-level tree fixture (root interior → interior → leaves)
+- [x] Hand-build a 3-level tree fixture (root interior → interior → leaves)
       across several `Vec<u8>` "pages" in a test harness (no real file I/O
       yet — that's Subproject 4) and test both point lookups and a full
       ordered scan against it.
@@ -179,23 +179,23 @@ basic buffer-pool management — a concept central to every real DBMS.
 
 **Checklist**
 
-- [ ] Define `PageId = u32` and a `Pager` struct wrapping a `std::fs::File`
+- [x] Define `PageId = u32` and a `Pager` struct wrapping a `std::fs::File`
       opened with read/write access, plus the page size (read from the
       header on open).
-- [ ] Implement `Pager::open(path) -> anyhow::Result<Pager>`: read the first
+- [x] Implement `Pager::open(path) -> anyhow::Result<Pager>`: read the first
       100... er, 23-ish bytes (whatever `MAZE_HEADER_SIZE` ends up being) to get
       the page size, validate the magic string.
-- [ ] Implement `Pager::create(path, page_size) -> anyhow::Result<Pager>`
+- [x] Implement `Pager::create(path, page_size) -> anyhow::Result<Pager>`
       for brand-new files (write a fresh header + an empty root leaf page).
-- [ ] Implement `Pager::read_page(id: PageId) -> anyhow::Result<&[u8]>` /
+- [x] Implement `Pager::read_page(id: PageId) -> anyhow::Result<&[u8]>` /
       `get_page_mut` backed by an in-memory cache (`HashMap<PageId, Vec<u8>>`
       to start — no eviction policy yet, note that as a known limitation).
-- [ ] Implement dirty-page tracking (a `HashSet<PageId>` or a flag per
+- [x] Implement dirty-page tracking (a `HashSet<PageId>` or a flag per
       cached page) and `Pager::flush() -> anyhow::Result<()>` that writes
       every dirty page back and clears the dirty set.
-- [ ] Implement `Pager::allocate_page() -> PageId` (append a new page at
+- [x] Implement `Pager::allocate_page() -> PageId` (append a new page at
       EOF for now — Subproject 7's freelist will make this smarter).
-- [ ] Rewire `btree::Cursor` to take a `&mut Pager` instead of raw page
+- [x] Rewire `btree::Cursor` to take a `&mut Pager` instead of raw page
       slices, and port the Subproject 3 tests to run against a real
       temp-file-backed `Pager` (use `tempfile`-style manual temp dirs, or
       just `std::env::temp_dir()` + a unique name, to avoid adding a crate).
@@ -215,13 +215,13 @@ most people mean when they say "I want to understand B-trees."
 
 **Checklist**
 
-- [ ] Implement `Cursor`/`BTree::insert(row_id, payload: &[u8])`: descend to
+- [x] Implement `Cursor`/`BTree::insert(row_id, payload: &[u8])`: descend to
       the correct leaf, insert the new cell in sorted position among
       existing cell pointers, shifting pointers as needed.
-- [ ] Implement overflow detection: after a tentative insert, check whether
+- [x] Implement overflow detection: after a tentative insert, check whether
       the cell content plus the pointer array still fits in the page; if
       not, the page must split.
-- [ ] Implement leaf split: allocate a new page via `Pager::allocate_page`,
+- [x] Implement leaf split: allocate a new page via `Pager::allocate_page`,
       move the upper half of cells to it, and determine the separator key
       (the first row id of the new right page, or last of the left,
       depending on your convention — document which).

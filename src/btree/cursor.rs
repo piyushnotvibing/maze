@@ -1,6 +1,10 @@
 use crate::file::{
     pager::Pager,
-    pages::{Page, leaf::TableLeafCell, types::PageNumber},
+    pages::{
+        Page,
+        leaf::{TableLeafCell, TableLeafPage},
+        types::PageNumber,
+    },
 };
 
 pub struct Cursor<'a> {
@@ -24,12 +28,31 @@ impl<'a> Cursor<'a> {
     }
 
     pub fn insert(&mut self, row_id: u64, payload: &[u8]) -> anyhow::Result<()> {
-        let (target, insert_idx) = self.get_leaf_page_for_insert(row_id, self.root_pn)?;
-        let lp = match target {
-            Page::TableLeaf(lp) => lp,
-            Page::TableInterior(_) => anyhow::bail!("can't insert into an interior page"),
+        let (pn, mut lp) = self.get_leaf_page_for_insert(row_id, self.root_pn)?;
+
+        let new_cell = TableLeafCell::new(row_id, payload);
+        if lp.fits(&new_cell, self.pager.page_size as usize, pn) {
+            lp.insert(new_cell, pn, self.pager.page_size as usize)?;
+        } else {
+            let new_pn = self.pager.allocate_page()?;
+            let (mut new_lp, split_row_id) = lp.split(pn, new_pn, self.pager.page_size as usize)?;
+
+            if new_cell.row_id <= split_row_id {
+                lp.insert(new_cell, pn, self.pager.page_size as usize)?;
+            } else {
+                new_lp.insert(new_cell, new_pn, self.pager.page_size as usize)?;
+            }
+
+            self.pager.write_page(
+                new_pn,
+                new_lp.serialize(new_pn, self.pager.page_size as usize)?,
+            )?;
         };
-        lp.cells.insert(insert_idx, element); // insert payload, then reserialize, then pager.write_page().
+
+        // todo, update new_lp's and lp's parent interior page, split that if it is needed.
+
+        self.pager
+            .write_page(pn, lp.serialize(pn, self.pager.page_size as usize)?)?;
 
         Ok(())
     }
@@ -54,12 +77,7 @@ impl<'a> Cursor<'a> {
                 Ok(res.ok().map(|idx| lp.cells[idx].clone()))
             }
             Page::TableInterior(ip) => {
-                let next_cell_idx = ip.cells.partition_point(|cell| cell.row_id < row_id);
-                let next = match ip.cells.get(next_cell_idx) {
-                    Some(cell) => cell.left_child,
-                    None => ip.rightmost_child,
-                };
-
+                let next = ip.child_of(row_id);
                 self.seek_from(next, row_id)
             }
         }
@@ -81,22 +99,18 @@ impl<'a> Cursor<'a> {
         }
         Ok(())
     }
-    
-    fn get_leaf_page_for_insert<'p>(&'p mut self, row_id: u64, check_page_number: PageNumber) -> anyhow::Result<(Page, usize)> {
-        match self.fetch_page(check_page_number)? {
-            Page::TableLeaf(lp) => {
-                let insert_idx = lp.cells.partition_point(|cell| cell.row_id < row_id);
-                Ok((Page::TableLeaf(lp), insert_idx))
-            },
-            Page::TableInterior(ip) => {
-                let next_cell_idx = ip.cells.partition_point(|cell| cell.row_id < row_id);
-                let next = match ip.cells.get(next_cell_idx) {
-                    Some(cell) => cell.left_child,
-                    None => ip.rightmost_child,
-                };
 
+    fn get_leaf_page_for_insert(
+        &mut self,
+        row_id: u64,
+        check_page_number: PageNumber,
+    ) -> anyhow::Result<(PageNumber, TableLeafPage)> {
+        match self.fetch_page(check_page_number)? {
+            Page::TableLeaf(lp) => Ok((check_page_number, lp)),
+            Page::TableInterior(ip) => {
+                let next = ip.child_of(row_id);
                 self.get_leaf_page_for_insert(row_id, next)
-            },
+            }
         }
     }
 }

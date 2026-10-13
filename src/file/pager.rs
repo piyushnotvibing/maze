@@ -10,8 +10,8 @@ use crate::file::{
 };
 
 pub struct Pager {
+    pub page_size: u32, // [2^9 to 2^16]
     file: File,
-    page_size: u32, // [2^9 to 2^16]
     cache: HashMap<PageNumber, Vec<u8>>,
     dirty: HashSet<u32>,
 }
@@ -39,10 +39,10 @@ impl Pager {
 
     // for new database creation -> writes header bytes along with an empty table leaf page in page 1.
     pub fn new(path: &str, page_size: u32) -> anyhow::Result<Self> {
-        let mut file = open_rw(path)?;
-        file.seek(SeekFrom::Start(0))?;
+        let create_new_file = true;
+        let mut file = open_rw(path, create_new_file)?;
 
-        let pn = PageNumber::try_from(1)?;
+        let pn1 = PageNumber::try_from(1)?;
         let no_rightmost_child = None;
         let no_cells = Vec::<TableLeafCell>::new();
 
@@ -50,11 +50,11 @@ impl Pager {
         // `MAZE_HEADER_SIZE` bytes for page 1 (left zeroed) -- this is the
         // whole page_size-length page 1 buffer, not just its own page header.
         let mut page1 =
-            PageType::TableLeaf.serialize(pn, no_rightmost_child, &no_cells, page_size as usize)?;
+            PageType::TableLeaf.serialize(pn1, no_rightmost_child, &no_cells, page_size as usize)?;
         let header = MazeHeader::new(page_size)?;
         page1[0..MAZE_HEADER_SIZE].copy_from_slice(&header.serialize());
 
-        file.write_all(&page1)?;
+        write_page_to_disk(&mut file, page_size, pn1, &page1)?;
 
         Ok(Self {
             file,
@@ -75,12 +75,24 @@ impl Pager {
         }
     }
 
+    pub fn get_page_mut(&mut self, page_number: PageNumber) -> anyhow::Result<&mut [u8]> {
+        use std::collections::hash_map::Entry;
+        match self.cache.entry(page_number) {
+            Entry::Occupied(oe) => Ok(oe.into_mut()),
+            Entry::Vacant(ve) => {
+                let bytes = read_page_from_disk(&mut self.file, self.page_size, page_number)?;
+                Ok(ve.insert(bytes))
+            }
+        }
+    }
+
     pub fn write_page(&mut self, page_number: PageNumber, bytes: Vec<u8>) -> anyhow::Result<()> {
         write_page_to_disk(&mut self.file, self.page_size, page_number, &bytes)?;
         self.cache.insert(page_number, bytes);
         Ok(())
     }
 
+    /// Creates a page buffer, writes it to disk and cache, returns mutable reference of the page buffer in cache.
     pub fn allocate_page(&mut self) -> anyhow::Result<PageNumber> {
         let new_pn = PageNumber::try_from(u32::try_from(
             self.file
@@ -120,13 +132,16 @@ fn write_page_to_disk(
     Ok(())
 }
 
-fn open_rw(path: &str) -> std::io::Result<File> {
-    OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(path)
+fn open_rw(path: &str, create: bool) -> std::io::Result<File> {
+    if create {
+        return OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path);
+    }
+    OpenOptions::new().read(true).write(true).open(path)
 }
 
 #[cfg(test)]
