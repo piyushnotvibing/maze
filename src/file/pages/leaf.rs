@@ -58,8 +58,7 @@ impl Cell for TableLeafCell {
 
 impl TableLeafCell {
     pub fn decode_payload(&self) -> anyhow::Result<Vec<Value>> {
-        let record = Record::build(&self.payload)?;
-        Ok(record.body)
+        Record::decode(&self.payload)
     }
 }
 

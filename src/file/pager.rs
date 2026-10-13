@@ -19,9 +19,6 @@ pub struct Pager {
 impl Pager {
     // for .mz files that have already been created.
     pub fn init(path: &str) -> anyhow::Result<Self> {
-        // Deliberately does NOT create the file: opening a path that doesn't
-        // exist yet is a real error here, not "start a new empty database" --
-        // that's what `Pager::new` is for.
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         file.seek(SeekFrom::Start(0))?;
 
@@ -50,7 +47,7 @@ impl Pager {
         let no_cells = Vec::<TableLeafCell>::new();
 
         // `PageType::serialize` already reserves the leading
-        // `MAZE_HEADER_SIZE` bytes for page 1 (left zeroed) -- this *is* the
+        // `MAZE_HEADER_SIZE` bytes for page 1 (left zeroed) -- this is the
         // whole page_size-length page 1 buffer, not just its own page header.
         let mut page1 =
             PageType::TableLeaf.serialize(pn, no_rightmost_child, &no_cells, page_size as usize)?;
@@ -123,8 +120,6 @@ fn write_page_to_disk(
     Ok(())
 }
 
-// Used only by `Pager::new`: creates the file if it's missing, and starts
-// from a clean slate (truncates) if a file already existed at this path.
 fn open_rw(path: &str) -> std::io::Result<File> {
     OpenOptions::new()
         .create(true)
