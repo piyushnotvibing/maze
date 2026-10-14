@@ -16,6 +16,7 @@
 */
 
 use crate::file::{
+    header::MAZE_HEADER_SIZE,
     pages::{Cell, PageHeader, PageNumber, PageType, bytes::read_word_u32_be, cell::parse_cells},
     varint,
 };
@@ -27,6 +28,13 @@ pub struct TableInteriorPage {
 }
 
 impl TableInteriorPage {
+    pub fn new(cells: Vec<TableInteriorCell>, rightmost_child: PageNumber) -> Self {
+        Self {
+            cells,
+            rightmost_child,
+        }
+    }
+
     pub fn child_of(&self, row_id: u64) -> PageNumber {
         let next_cell_idx = self.cells.partition_point(|cell| cell.row_id < row_id);
         match self.cells.get(next_cell_idx) {
@@ -52,6 +60,86 @@ impl TableInteriorPage {
             &self.cells,
             page_size,
         )
+    }
+
+    pub fn insert(
+        &mut self,
+        new_cell: TableInteriorCell,
+        page_number: PageNumber,
+        page_size: usize,
+    ) -> anyhow::Result<()> {
+        let new_row_id = new_cell.row_id;
+        let insert_idx = self.cells.partition_point(|cell| cell.row_id < new_row_id);
+        if self
+            .cells
+            .get(insert_idx)
+            .is_some_and(|c| c.row_id == new_row_id)
+        {
+            anyhow::bail!("row_id {new_row_id} already exists")
+        }
+
+        if !self.fits(&new_cell, page_number, page_size) {
+            anyhow::bail!("new cell does not fit in this interior page")
+        }
+
+        self.cells.insert(insert_idx, new_cell);
+
+        Ok(())
+    }
+
+    pub fn fits(
+        &self,
+        new_cell: &TableInteriorCell,
+        page_number: PageNumber,
+        page_size: usize,
+    ) -> bool {
+        let (cell_count, total_cell_len) = (self.cells.len(), self.cell_len());
+
+        match page_number.get() {
+            1 => {
+                page_size
+                    >= MAZE_HEADER_SIZE
+                        + PageType::TableInterior.header_size()
+                        + 2 * (cell_count + 1)
+                        + (total_cell_len + new_cell.encoded_len())
+            }
+            _ => {
+                page_size
+                    >= PageType::TableInterior.header_size()
+                        + 2 * (cell_count + 1)
+                        + (total_cell_len + new_cell.encoded_len())
+            }
+        }
+    }
+
+    pub fn split(&mut self) -> anyhow::Result<(Self, u64)> {
+        let mid = self
+            .cells
+            .len()
+            .checked_div(2)
+            .ok_or_else(|| anyhow::anyhow!("gng idek how this errored don't ask"))?;
+
+        let mid_cell = self
+            .cells
+            .get(mid)
+            .ok_or_else(|| anyhow::anyhow!("this interior page has no cell in the middle?"))?;
+
+        let (divider, self_new_right) = (mid_cell.row_id, mid_cell.left_child);
+
+        let mut new_ip_cells = self.cells.split_off(mid);
+        let _ = new_ip_cells.remove(0);
+        let new_ip = Self::new(new_ip_cells, self.rightmost_child);
+
+        self.rightmost_child = self_new_right;
+
+        Ok((new_ip, divider))
+    }
+
+    fn cell_len(&self) -> usize {
+        self.cells
+            .iter()
+            .map(|cell| cell.encoded_len())
+            .sum::<usize>()
     }
 }
 
@@ -83,6 +171,12 @@ pub struct TableInteriorCell {
     pub left_child: PageNumber,
     // Varint encoded on disk.
     pub row_id: u64,
+}
+
+impl TableInteriorCell {
+    pub fn new(left_child: PageNumber, row_id: u64) -> Self {
+        Self { left_child, row_id }
+    }
 }
 
 impl Cell for TableInteriorCell {

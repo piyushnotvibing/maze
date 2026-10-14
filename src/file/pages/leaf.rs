@@ -18,13 +18,6 @@ impl TableLeafPage {
         Self { cells }
     }
 
-    pub fn cell_len(&self) -> usize {
-        self.cells
-            .iter()
-            .map(|cell| cell.encoded_len())
-            .sum::<usize>()
-    }
-
     pub fn serialize(&self, page_number: PageNumber, page_size: usize) -> anyhow::Result<Vec<u8>> {
         let no_rightmost_child = None;
         PageType::TableLeaf.serialize(page_number, no_rightmost_child, &self.cells, page_size)
@@ -49,7 +42,7 @@ impl TableLeafPage {
             anyhow::bail!("row_id {new_row_id} already exists")
         }
 
-        if !self.fits(&new_cell, page_size, page_number) {
+        if !self.fits(&new_cell, page_number, page_size) {
             anyhow::bail!("new cell does not fit in this leaf page")
         }
 
@@ -62,8 +55,8 @@ impl TableLeafPage {
     pub fn fits(
         &self,
         new_cell: &TableLeafCell,
-        page_size: usize,
         page_number: PageNumber,
+        page_size: usize,
     ) -> bool {
         /*
             let's make some things clear: cell_count = self.cells.len(), total_cell_len = the length of all the cells combined
@@ -88,6 +81,13 @@ impl TableLeafPage {
                         + (total_cell_len + new_cell.encoded_len())
             }
         }
+    }
+
+    fn cell_len(&self) -> usize {
+        self.cells
+            .iter()
+            .map(|cell| cell.encoded_len())
+            .sum::<usize>()
     }
 
     /// Caller should call this if a new cell does not fit into the

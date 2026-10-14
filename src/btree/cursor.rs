@@ -1,7 +1,9 @@
 use crate::file::{
+    header::{MAZE_HEADER_SIZE, MazeHeader},
     pager::Pager,
     pages::{
         Page,
+        interior::{TableInteriorCell, TableInteriorPage},
         leaf::{TableLeafCell, TableLeafPage},
         types::PageNumber,
     },
@@ -28,33 +30,35 @@ impl<'a> Cursor<'a> {
     }
 
     pub fn insert(&mut self, row_id: u64, payload: &[u8]) -> anyhow::Result<()> {
-        let (pn, mut lp) = self.get_leaf_page_for_insert(row_id, self.root_pn)?;
+        let res = self.insert_into(self.root_pn, row_id, payload)?;
+        match res {
+            InsertOutcome::Done => Ok(()),
+            InsertOutcome::Split {
+                new_child, divider, ..
+            } => {
+                let root_page_bytes = self.pager.get_page(self.root_pn)?.to_vec();
+                let new_pn = self.pager.allocate_page()?;
+                let root = Page::parse(&root_page_bytes, self.root_pn)?;
 
-        let new_cell = TableLeafCell::new(row_id, payload);
-        if lp.fits(&new_cell, self.pager.page_size as usize, pn) {
-            lp.insert(new_cell, pn, self.pager.page_size as usize)?;
-        } else {
-            let new_pn = self.pager.allocate_page()?;
-            let (mut new_lp, split_row_id) = lp.split(pn, new_pn, self.pager.page_size as usize)?;
+                self.pager.write_page(
+                    new_pn,
+                    root.serialize(new_pn, self.pager.page_size as usize)?,
+                )?;
 
-            if new_cell.row_id <= split_row_id {
-                lp.insert(new_cell, pn, self.pager.page_size as usize)?;
-            } else {
-                new_lp.insert(new_cell, new_pn, self.pager.page_size as usize)?;
+                let new_root = TableInteriorPage::new(
+                    vec![TableInteriorCell::new(new_pn, divider)],
+                    new_child,
+                );
+
+                let mut new_root_bytes =
+                    new_root.serialize(self.root_pn, self.pager.page_size as usize)?;
+                new_root_bytes[0..MAZE_HEADER_SIZE]
+                    .copy_from_slice(&MazeHeader::new(self.pager.page_size)?.serialize());
+                self.pager.write_page(self.root_pn, new_root_bytes)?;
+
+                Ok(())
             }
-
-            self.pager.write_page(
-                new_pn,
-                new_lp.serialize(new_pn, self.pager.page_size as usize)?,
-            )?;
-        };
-
-        // todo, update new_lp's and lp's parent interior page, split that if it is needed.
-
-        self.pager
-            .write_page(pn, lp.serialize(pn, self.pager.page_size as usize)?)?;
-
-        Ok(())
+        }
     }
 
     fn fetch_page(&mut self, page_number: PageNumber) -> anyhow::Result<Page> {
@@ -106,13 +110,143 @@ impl<'a> Cursor<'a> {
         check_page_number: PageNumber,
     ) -> anyhow::Result<(PageNumber, TableLeafPage)> {
         match self.fetch_page(check_page_number)? {
-            Page::TableLeaf(lp) => Ok((check_page_number, lp)),
+            Page::TableLeaf(lp) => {
+                if lp.cells.iter().any(|cell| cell.row_id == row_id) {
+                    anyhow::bail!("row_id already exists, can't insert duplicate")
+                }
+                Ok((check_page_number, lp))
+            }
             Page::TableInterior(ip) => {
                 let next = ip.child_of(row_id);
                 self.get_leaf_page_for_insert(row_id, next)
             }
         }
     }
+
+    fn insert_into(
+        &mut self,
+        page_number: PageNumber,
+        row_id: u64,
+        payload: &[u8],
+    ) -> anyhow::Result<InsertOutcome> {
+        match self.fetch_page(page_number)? {
+            Page::TableLeaf(mut lp) => {
+                let new_cell = TableLeafCell::new(row_id, payload);
+                if lp.fits(&new_cell, page_number, self.pager.page_size as usize) {
+                    lp.insert(new_cell, page_number, self.pager.page_size as usize)?;
+                    self.pager.write_page(
+                        page_number,
+                        lp.serialize(page_number, self.pager.page_size as usize)?,
+                    )?;
+                    return Ok(InsertOutcome::Done);
+                } else {
+                    let new_pn = self.pager.allocate_page()?;
+                    let (mut new_lp, divider) =
+                        lp.split(page_number, new_pn, self.pager.page_size as usize)?;
+
+                    if new_cell.row_id <= divider {
+                        lp.insert(new_cell, page_number, self.pager.page_size as usize)?;
+                    } else {
+                        new_lp.insert(new_cell, new_pn, self.pager.page_size as usize)?;
+                    }
+
+                    self.pager.write_page(
+                        page_number,
+                        lp.serialize(page_number, self.pager.page_size as usize)?,
+                    )?;
+
+                    self.pager.write_page(
+                        new_pn,
+                        new_lp.serialize(new_pn, self.pager.page_size as usize)?,
+                    )?;
+
+                    return Ok(InsertOutcome::Split {
+                        old_child: page_number,
+                        new_child: new_pn,
+                        divider,
+                    });
+                }
+            }
+            Page::TableInterior(mut ip) => {
+                let next = ip.child_of(row_id);
+                match self.insert_into(next, row_id, payload)? {
+                    InsertOutcome::Done => return Ok(InsertOutcome::Done),
+                    InsertOutcome::Split {
+                        old_child,
+                        new_child,
+                        divider,
+                    } => {
+                        repoint_child(&mut ip, old_child, new_child)?;
+                        let new_cell = TableInteriorCell::new(old_child, divider);
+                        self.insert_or_split_interior(ip, page_number, new_cell)
+                    }
+                }
+            }
+        }
+    }
+
+    fn insert_or_split_interior(
+        &mut self,
+        mut ip: TableInteriorPage,
+        page_number: PageNumber,
+        new_cell: TableInteriorCell,
+    ) -> anyhow::Result<InsertOutcome> {
+        if ip.fits(&new_cell, page_number, self.pager.page_size as usize) {
+            ip.insert(new_cell, page_number, self.pager.page_size as usize)?;
+            self.pager.write_page(
+                page_number,
+                ip.serialize(page_number, self.pager.page_size as usize)?,
+            )?;
+            return Ok(InsertOutcome::Done);
+        }
+
+        let new_pn = self.pager.allocate_page()?;
+        let (mut new_ip, divider) = ip.split()?;
+        if new_cell.row_id <= divider {
+            ip.insert(new_cell, page_number, self.pager.page_size as usize)?;
+        } else {
+            new_ip.insert(new_cell, new_pn, self.pager.page_size as usize)?;
+        }
+        self.pager.write_page(
+            page_number,
+            ip.serialize(page_number, self.pager.page_size as usize)?,
+        )?;
+        self.pager.write_page(
+            new_pn,
+            new_ip.serialize(new_pn, self.pager.page_size as usize)?,
+        )?;
+        Ok(InsertOutcome::Split {
+            old_child: page_number,
+            new_child: new_pn,
+            divider,
+        })
+    }
+}
+
+fn repoint_child(
+    ip: &mut TableInteriorPage,
+    old_child: PageNumber,
+    new_child: PageNumber,
+) -> anyhow::Result<()> {
+    if let Some(cell) = ip.cells.iter_mut().find(|c| c.left_child == old_child) {
+        cell.left_child = new_child;
+    } else if ip.rightmost_child == old_child {
+        ip.rightmost_child = new_child;
+    } else {
+        anyhow::bail!(
+            "parent interior page does not have a cell pointing to a child page with page number {old_child}"
+        );
+    }
+    Ok(())
+}
+
+enum InsertOutcome {
+    Done,
+    Split {
+        old_child: PageNumber,
+        new_child: PageNumber,
+        divider: u64,
+    },
 }
 
 #[cfg(test)]
@@ -255,6 +389,35 @@ mod tests {
                 "expected row {row_id} to be absent"
             );
         }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn insert_100_ascending_rows_all_remain_reachable() {
+        let path = temp_db_path("insert_100_ascending");
+        let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
+        let mut cursor = Cursor::new(&mut pager, pn(1));
+
+        for i in 1u64..=100 {
+            cursor.insert(i, &i.to_be_bytes()).unwrap();
+        }
+
+        for i in 1u64..=100 {
+            assert_eq!(
+                cursor.seek(i).unwrap().map(|c| c.row_id),
+                Some(i),
+                "row {i} should be findable via seek after inserting 100 ascending rows"
+            );
+        }
+
+        let scanned: Vec<u64> = cursor
+            .scan()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.row_id)
+            .collect();
+        assert_eq!(scanned, (1u64..=100).collect::<Vec<u64>>());
 
         std::fs::remove_file(&path).ok();
     }
