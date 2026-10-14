@@ -196,6 +196,7 @@ enum InsertOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::btree::check::check_tree;
     use crate::file::pages::interior::{TableInteriorCell, TableInteriorPage};
     use crate::file::pages::leaf::TableLeafPage;
     use crate::file::pages::spec::PageSpec;
@@ -575,5 +576,25 @@ mod tests {
             Page::TableInterior(_)
         ));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn ensure_5000_row_tree_stats_are_correct() {
+        let path = temp_db_path("insert_5000_ascending");
+        let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
+        let mut cursor = Cursor::new(&mut pager, pn(1));
+
+        let data = shuffled(5000);
+
+        for elem in &data {
+            cursor.insert(*elem, &elem.to_be_bytes()).unwrap();
+        }
+
+        let stats = check_tree(&mut pager, pn(1)).unwrap();
+        assert_eq!(stats.rows, 5000);
+        assert_eq!(
+            stats.pages.len() as u64 * PAGE_SIZE as u64,
+            std::fs::metadata(&path).unwrap().len(), // every page in the file belongs to the tree
+        );
     }
 }

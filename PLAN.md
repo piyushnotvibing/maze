@@ -232,11 +232,11 @@ most people mean when they say "I want to understand B-trees."
       new pages for the old root's contents and turn the root page into a
       fresh interior page with one separator — root page number never
       changes, which matters once Subproject 9 stores it in the catalog.
-- [ ] Write invariant-checking test helpers now (you'll reuse them in
+- [x] Write invariant-checking test helpers now (you'll reuse them in
       Subproject 6): every leaf at the same depth, every leaf's keys sorted
       and non-overlapping with siblings, every interior separator consistent
       with the max key in its left subtree.
-- [ ] Test: insert enough rows (in both ascending and random order) to force
+- [x] Test: insert enough rows (in both ascending and random order) to force
       multiple splits and at least one root split; then do a full ordered
       scan via the pager-backed file and assert every row comes back
       correct and in order; run the invariant checker over the resulting
