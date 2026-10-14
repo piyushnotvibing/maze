@@ -225,10 +225,10 @@ most people mean when they say "I want to understand B-trees."
       move the upper half of cells to it, and determine the separator key
       (the first row id of the new right page, or last of the left,
       depending on your convention — document which).
-- [ ] Implement separator propagation into the parent interior page:
+- [x] Implement separator propagation into the parent interior page:
       insert `(separator_key, new_child_page)` into the parent, which may
       itself overflow and split (recursive/iterative "split propagation").
-- [ ] Implement root split: when the root itself overflows, allocate two
+- [x] Implement root split: when the root itself overflows, allocate two
       new pages for the old root's contents and turn the root page into a
       fresh interior page with one separator — root page number never
       changes, which matters once Subproject 9 stores it in the catalog.

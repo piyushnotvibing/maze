@@ -1,8 +1,9 @@
 use crate::file::{
-    header::MAZE_HEADER_SIZE,
     pages::{
-        PageHeader, PageType,
-        cell::{Cell, parse_cells},
+        PageType,
+        cell::Cell,
+        spec::PageSpec,
+        table::{SplitKind, TablePage, best_split},
         types::PageNumber,
     },
     varint,
@@ -18,192 +19,71 @@ impl TableLeafPage {
         Self { cells }
     }
 
-    pub fn serialize(&self, page_number: PageNumber, page_size: usize) -> anyhow::Result<Vec<u8>> {
-        let no_rightmost_child = None;
-        PageType::TableLeaf.serialize(page_number, no_rightmost_child, &self.cells, page_size)
-    }
-
-    /// Assumes that the caller (Cursor) has already checked if the cell fits. If it
-    /// doesn't it also assumes the insertion is being done in the right leaf page formed
-    /// after the split.
-    pub fn insert(
-        &mut self,
-        new_cell: TableLeafCell,
-        page_number: PageNumber,
-        page_size: usize,
-    ) -> anyhow::Result<()> {
-        let new_row_id = new_cell.row_id;
-        let insert_idx = self.cells.partition_point(|cell| cell.row_id < new_row_id);
-        if self
-            .cells
-            .get(insert_idx)
-            .is_some_and(|c| c.row_id == new_row_id)
-        {
-            anyhow::bail!("row_id {new_row_id} already exists")
-        }
-
-        if !self.fits(&new_cell, page_number, page_size) {
-            anyhow::bail!("new cell does not fit in this leaf page")
-        }
-
-        self.cells.insert(insert_idx, new_cell);
-
-        Ok(())
-    }
-
-    /// Caller (Cursor) should call this before insertion.
-    pub fn fits(
-        &self,
-        new_cell: &TableLeafCell,
-        page_number: PageNumber,
-        page_size: usize,
-    ) -> bool {
-        /*
-            let's make some things clear: cell_count = self.cells.len(), total_cell_len = the length of all the cells combined
-
-            if page_number == 1: checks if page_size >= (MAZE_HEADER_SIZE + leaf page header size + (2*(cell_count + 1)) + (total_cell_len + length of the new cell))
-            else: checks if page_size >= PageType::TableLeaf.header_size() + (2*(cell_count + 1)) + (total_cell_len + new_cell.serialize().len()))
-        */
-        let (cell_count, total_cell_len) = (self.cells.len(), self.cell_len());
-
-        match page_number.get() {
-            1 => {
-                page_size
-                    >= MAZE_HEADER_SIZE
-                        + PageType::TableLeaf.header_size()
-                        + 2 * (cell_count + 1)
-                        + (total_cell_len + new_cell.encoded_len())
-            }
-            _ => {
-                page_size
-                    >= PageType::TableLeaf.header_size()
-                        + 2 * (cell_count + 1)
-                        + (total_cell_len + new_cell.encoded_len())
-            }
-        }
-    }
-
-    fn cell_len(&self) -> usize {
+    pub fn contains(&self, row_id: u64) -> bool {
         self.cells
-            .iter()
-            .map(|cell| cell.encoded_len())
-            .sum::<usize>()
-    }
-
-    /// Caller should call this if a new cell does not fit into the
-    /// leaf page it's supposed to be inserted in. Pseudocode:
-    /// ```pseudocode
-    /// if lp.fits(new_cell) then
-    ///     lp.insert(new_cell)
-    /// else
-    ///     new_pn = cursor.pager.allocate_page()
-    ///     new_lp, divider = lp.split() {where divider = max(left_lp), new_lp = right_lp}
-    ///     
-    ///     if new_cell.row_id <= new_split_row_id then lp.insert(new_cell)
-    ///     else new_lp.insert(new_cell), cursor.pager.write_page(new_pn, new_lp.serialize())
-    ///     
-    ///     insert new interior cell into new_lp's & lp's parent and handle its split (if it splits)    
-    ///     
-    ///     cursor.pager.write_page(pn, lp.serialize())
-    /// ```
-    pub fn split(
-        &mut self,
-        self_pn: PageNumber,
-        right_pn: PageNumber,
-        page_size: usize,
-    ) -> anyhow::Result<(Self, u64)> {
-        if self.cells.len() < 2 {
-            anyhow::bail!("cannot split a page with less than 2 cells")
-        }
-
-        let total_cell_len = self.cell_len();
-        let target = total_cell_len / 2;
-        let (mut running, mut split_idx) = (0, 0);
-        for (i, cell) in self.cells.iter().enumerate() {
-            running += cell.encoded_len();
-            if running >= target {
-                split_idx = i + 1;
-                break;
-            }
-        }
-        let mut split_idx = split_idx.clamp(1, self.cells.len() - 1);
-
-        let mut right = self.cells.split_off(split_idx);
-        let mut divider = match self.cells.last() {
-            Some(cell) => cell.row_id,
-            None => anyhow::bail!("split didn't leave left child with any cells"),
-        };
-        if divider >= right[0].row_id {
-            anyhow::bail!(
-                "wtf the last row_id of left leaf page is greater than first row_id of right leaf page"
-            )
-        }
-
-        let usable = |pn: PageNumber| -> usize {
-            page_size
-                .checked_sub(if pn == 1 { MAZE_HEADER_SIZE } else { 0 })
-                .ok_or_else(|| anyhow::anyhow!("what the actual fuck"))
-                .unwrap()
-        };
-        let lp_size = |cells: &[TableLeafCell]| -> usize {
-            PageType::TableLeaf.header_size()
-                + 2 * cells.len()
-                + cells.iter().map(|cell| cell.encoded_len()).sum::<usize>()
-        };
-
-        let total_len = self.cells.len() + right.len();
-        for _ in 0..total_len {
-            let left_overflowed = usable(self_pn) < lp_size(&self.cells);
-            let right_overflowed = usable(right_pn) < lp_size(&right);
-
-            if !left_overflowed && !right_overflowed {
-                break;
-            } else if left_overflowed {
-                if split_idx == 1 {
-                    anyhow::bail!("overflow support needed")
-                }
-                split_idx = split_idx
-                    .checked_sub(1)
-                    .ok_or_else(|| anyhow::anyhow!("split_idx went negative bro pack it up"))?
-            } else if right_overflowed {
-                split_idx += 1;
-                if split_idx == total_len {
-                    anyhow::bail!("overflow support needed")
-                }
-            }
-
-            self.cells.extend(right);
-            split_idx = split_idx.clamp(1, self.cells.len() - 1);
-            right = self.cells.split_off(split_idx);
-            divider = match self.cells.last() {
-                Some(cell) => cell.row_id,
-                None => anyhow::bail!("split didn't leave left child with any cells"),
-            };
-            if divider >= right[0].row_id {
-                anyhow::bail!(
-                    "wtf the last row_id of left leaf page is greater than first row_id of right leaf page"
-                )
-            }
-        }
-
-        let left_overflowed = usable(self_pn) < lp_size(&self.cells);
-        let right_overflowed = usable(right_pn) < lp_size(&right);
-        if left_overflowed || right_overflowed {
-            anyhow::bail!("overflow support needed")
-        }
-
-        Ok((TableLeafPage::new(right), divider))
+            .binary_search_by_key(&row_id, |cell| cell.row_id)
+            .is_ok()
     }
 }
 
-impl TryFrom<&[u8]> for TableLeafPage {
-    type Error = anyhow::Error;
+impl TablePage for TableLeafPage {
+    type C = TableLeafCell;
 
-    fn try_from(buf: &[u8]) -> anyhow::Result<Self> {
-        let header = PageHeader::parse(buf, PageType::TableLeaf)?;
-        let cells = parse_cells(buf, header, PageType::TableLeaf)?;
+    const PAGE_TYPE: PageType = PageType::TableLeaf;
+
+    fn from_parts(
+        cells: Vec<Self::C>,
+        rightmost_child: Option<PageNumber>,
+    ) -> anyhow::Result<Self> {
+        if rightmost_child.is_some() {
+            anyhow::bail!("leaf page cannot have a rightmost child")
+        }
 
         Ok(Self { cells })
+    }
+
+    fn cells(&self) -> &[TableLeafCell] {
+        &self.cells
+    }
+
+    fn cells_mut(&mut self) -> &mut Vec<Self::C> {
+        &mut self.cells
+    }
+
+    /// Consumes the page, returns the left page, right page and divider `row_id`.
+    fn split_with(
+        mut self,
+        new_cell: Self::C,
+        left: PageSpec,
+        right: PageSpec,
+    ) -> anyhow::Result<(Self, Self, u64)> {
+        self.insert_unchecked(new_cell)?;
+
+        let split_idx = best_split(
+            &self.cell_costs(),
+            SplitKind::TableLeafSplit,
+            PageType::TableLeaf.header_size(),
+            left.usable()?,
+            right.usable()?,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!("no two-way split can hold this cell: need overflow support")
+        })?;
+
+        let right_lp_cells = self.cells.split_off(split_idx);
+        let divider = self.cells[split_idx - 1].row_id;
+
+        Ok((
+            self,
+            Self {
+                cells: right_lp_cells,
+            },
+            divider,
+        ))
+    }
+
+    fn rightmost_child(&self) -> Option<PageNumber> {
+        None
     }
 }
 
@@ -239,16 +119,13 @@ impl Cell for TableLeafCell {
     fn sort_key(&self) -> u64 {
         self.row_id
     }
-}
 
-impl TryFrom<&[u8]> for TableLeafCell {
-    type Error = anyhow::Error;
-
-    fn try_from(buf: &[u8]) -> anyhow::Result<Self> {
+    /// ps to be used when overflow pages will be supported.
+    fn parse(buf: &[u8], _ps: PageSpec) -> anyhow::Result<Self> {
         let (size, size_bytes_read) =
             varint::decode(buf).ok_or(anyhow::anyhow!("invalid cell size varint"))?;
         let (row_id, rowid_bytes_read) = varint::decode(&buf[size_bytes_read..])
-            .ok_or(anyhow::anyhow!("invalid row_id varint"))?;
+            .ok_or_else(|| anyhow::anyhow!("invalid row_id varint"))?;
 
         let start = size_bytes_read + rowid_bytes_read;
         let end = usize::try_from(size)
@@ -287,7 +164,8 @@ mod tests {
             row_id: 300,
             payload: b"abc".to_vec(),
         };
-        let parsed = TableLeafCell::try_from(cell.serialize().as_slice()).unwrap();
+        let ps = PageSpec::fresh(512);
+        let parsed = TableLeafCell::parse(cell.serialize().as_slice(), ps).unwrap();
         assert_eq!((parsed.row_id, parsed.payload), (300, b"abc".to_vec()));
     }
 
@@ -351,7 +229,8 @@ mod tests {
         }
 
         let page_number = PageNumber::try_from(1).unwrap();
-        let page = Page::parse(&buf, page_number).unwrap();
+        let ps = PageSpec::new(PAGE_SIZE, page_number);
+        let page = Page::parse(&buf, ps).unwrap();
         if let Page::TableLeaf(leaf) = page {
             assert_eq!(leaf.cells.len(), rows.len());
             for (cell, (row_id, expected)) in leaf.cells.iter().zip(&rows) {
@@ -365,10 +244,11 @@ mod tests {
 
     #[test]
     fn empty_leaf_page_is_valid() {
+        let ps = PageSpec::fresh(512);
         let mut buf = vec![0u8; 512];
         buf[0] = PageType::TableLeaf.into();
         buf[3..5].copy_from_slice(&512u16.to_be_bytes()); // cell area starts at page end
-        let leaf = TableLeafPage::try_from(buf.as_slice()).unwrap();
+        let leaf = TableLeafPage::parse(buf.as_slice(), ps).unwrap();
         assert!(leaf.cells.is_empty());
     }
 
@@ -381,6 +261,7 @@ mod tests {
         const LEAF_HEADER: usize = 5;
         const PTR_END: usize = LEAF_HEADER + 2 * 2; // 9
 
+        let ps = PageSpec::fresh(PAGE_SIZE);
         // Cell B (row_id 2, small payload).
         let b_payload = b"XYZ".to_vec();
         let mut b_bytes = varint::encode(b_payload.len() as u64);
@@ -413,10 +294,47 @@ mod tests {
         buf[a_start..a_start + a_len].copy_from_slice(&a_bytes);
 
         // Sanity: pointer 1 really does decode as a valid row_id-2 cell.
-        let inner = TableLeafCell::try_from(&buf[b_ptr as usize..]).unwrap();
+        let inner = TableLeafCell::parse(&buf[b_ptr as usize..], ps).unwrap();
         assert_eq!(inner.row_id, 2);
         assert_eq!(inner.payload, b_payload);
 
-        assert!(TableLeafPage::try_from(buf.as_slice()).is_err());
+        assert!(TableLeafPage::parse(buf.as_slice(), ps).is_err());
+    }
+
+    #[test]
+    fn split_with_a_big_cell_at_every_position_gives_halves_that_fit_or_errors() {
+        let left_spec = PageSpec::new(512, PageNumber::try_from(1).unwrap());
+        let right_spec = PageSpec::fresh(512);
+
+        for big_id in (1u64..=61).step_by(2) {
+            // odd ids: before, between and after the 30 small rows
+            let page = TableLeafPage::new(
+                (1u64..=30)
+                    .map(|i| TableLeafCell::new(i * 2, &[i as u8; 10]))
+                    .collect(),
+            );
+            let big = TableLeafCell::new(big_id, &[0xABu8; 300]);
+            let result = page.clone().split_with(big.clone(), left_spec, right_spec);
+
+            // 14 or 15 small cells before the big one: no two-way split can hold it
+            assert_eq!(
+                result.is_ok(),
+                !matches!(big_id, 29 | 31),
+                "big_id {big_id}"
+            );
+
+            if let Ok((left, right, divider)) = result {
+                left.serialize(left_spec).unwrap(); // both halves must really fit
+                right.serialize(right_spec).unwrap();
+                assert_eq!(left.cells.last().unwrap().row_id, divider);
+                assert!(right.cells[0].row_id > divider);
+
+                let mut want = page.cells.clone();
+                want.push(big);
+                want.sort_by_key(|c| c.row_id);
+                let got: Vec<_> = left.cells.iter().chain(&right.cells).cloned().collect();
+                assert_eq!(got, want); // nothing lost, nothing duplicated
+            }
+        }
     }
 }

@@ -2,17 +2,19 @@ pub mod cell;
 pub mod header;
 pub mod interior;
 pub mod leaf;
+pub mod spec;
+pub mod table;
 pub mod types;
 
 mod bytes;
 
-use crate::file::{
-    header::MAZE_HEADER_SIZE,
-    pages::{
-        cell::Cell, header::PageHeader, interior::TableInteriorPage, leaf::TableLeafPage,
-        types::PageNumber,
-    },
+use crate::file::pages::{
+    cell::Cell, interior::TableInteriorPage, leaf::TableLeafPage, spec::PageSpec, table::TablePage,
+    types::PageNumber,
 };
+
+// Each cell pointer in a page is 2 bytes long (they are u16s).
+pub const CELL_PTR_SIZE: usize = 2;
 
 #[derive(Debug, Clone)]
 pub enum Page {
@@ -21,15 +23,9 @@ pub enum Page {
 }
 
 impl Page {
-    pub fn parse(mut buf: &[u8], page_number: PageNumber) -> anyhow::Result<Page> {
-        let data_offset = if page_number == 1 {
-            MAZE_HEADER_SIZE
-        } else {
-            0
-        };
-
+    pub fn parse(mut buf: &[u8], ps: PageSpec) -> anyhow::Result<Page> {
         buf = buf
-            .get(data_offset..)
+            .get(ps.base_offset()..)
             .ok_or_else(|| anyhow::anyhow!("page smaller than page header"))?;
 
         let page_type = match PageType::try_from(
@@ -41,15 +37,15 @@ impl Page {
         };
 
         match page_type {
-            PageType::TableLeaf => Ok(Page::TableLeaf(TableLeafPage::try_from(buf)?)),
-            PageType::TableInterior => Ok(Page::TableInterior(TableInteriorPage::try_from(buf)?)),
+            PageType::TableLeaf => Ok(Page::TableLeaf(TableLeafPage::parse(buf, ps)?)),
+            PageType::TableInterior => Ok(Page::TableInterior(TableInteriorPage::parse(buf, ps)?)),
         }
     }
 
-    pub fn serialize(&self, page_number: PageNumber, page_size: usize) -> anyhow::Result<Vec<u8>> {
+    pub fn serialize(&self, ps: PageSpec) -> anyhow::Result<Vec<u8>> {
         match self {
-            Page::TableLeaf(lp) => lp.serialize(page_number, page_size),
-            Page::TableInterior(ip) => ip.serialize(page_number, page_size),
+            Page::TableLeaf(lp) => lp.serialize(ps),
+            Page::TableInterior(ip) => ip.serialize(ps),
         }
     }
 }
@@ -63,25 +59,23 @@ pub(crate) enum PageType {
 impl PageType {
     pub(crate) fn serialize<C: Cell>(
         &self,
-        page_number: PageNumber,
-        rightmost_child: Option<PageNumber>,
         cells: &[C],
-        page_size: usize,
+        rightmost_child: Option<PageNumber>,
+        ps: PageSpec,
     ) -> anyhow::Result<Vec<u8>> {
         let cells_bytes = cells
             .iter()
             .map(|c| c.serialize())
             .collect::<Vec<Vec<u8>>>();
 
-        self.pack(page_number, rightmost_child, &cells_bytes, page_size)
+        self.pack(&cells_bytes, rightmost_child, ps)
     }
 
     fn pack(
         self,
-        page_number: PageNumber,
-        rightmost_child: Option<PageNumber>,
         cells: &[Vec<u8>],
-        page_size: usize,
+        rightmost_child: Option<PageNumber>,
+        ps: PageSpec,
     ) -> anyhow::Result<Vec<u8>> {
         match self {
             PageType::TableInterior if rightmost_child.is_none() => {
@@ -92,12 +86,9 @@ impl PageType {
             }
             _ => {}
         }
-        let page_offset = match page_number.get() {
-            1 => MAZE_HEADER_SIZE,
-            _ => 0,
-        };
+        let page_offset = ps.base_offset();
 
-        let mut p_buf = vec![0u8; page_size];
+        let mut p_buf = vec![0u8; ps.page_size()];
 
         /*
             A page's header contains:
@@ -110,7 +101,8 @@ impl PageType {
         let all_cells_len: usize = cells.iter().map(Vec::len).sum();
         let cell_count = cells.len();
         let cell_ptrs_region_end = header_size + 2 * cell_count;
-        let cell_content_offset = page_size
+        let cell_content_offset = ps
+            .page_size()
             .checked_sub(page_offset)
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -237,7 +229,8 @@ mod tests {
             buf[o..o + 2].copy_from_slice(&p.to_be_bytes());
         }
 
-        let page = Page::parse(&buf, PageNumber::try_from(1).unwrap()).unwrap();
+        let ps = PageSpec::new(PAGE_SIZE, PageNumber::try_from(1).unwrap());
+        let page = Page::parse(&buf, ps).unwrap();
         if let Page::TableLeaf(leaf) = page {
             assert_eq!(leaf.cells.len(), rows.len());
             for (cell, (id, payload)) in leaf.cells.iter().zip(&rows) {
@@ -259,6 +252,7 @@ mod tests {
     fn leaf_page_round_trips_at_page_number_one() {
         const PAGE_SIZE: usize = 512;
         let pn1 = PageNumber::try_from(1).unwrap();
+        let ps = PageSpec::new(PAGE_SIZE, pn1);
 
         let original = TableLeafPage {
             cells: vec![
@@ -273,9 +267,7 @@ mod tests {
             ],
         };
 
-        let bytes = Page::TableLeaf(original.clone())
-            .serialize(pn1, PAGE_SIZE)
-            .unwrap();
+        let bytes = Page::TableLeaf(original.clone()).serialize(ps).unwrap();
 
         // The file-header region must stay untouched by page-serialization
         // code — only the Pager/MazeHeader should ever write there.
@@ -284,7 +276,7 @@ mod tests {
             vec![0u8; MAZE_HEADER_SIZE].as_slice()
         );
 
-        match Page::parse(&bytes, pn1).unwrap() {
+        match Page::parse(&bytes, ps).unwrap() {
             Page::TableLeaf(parsed) => assert_eq!(parsed, original),
             Page::TableInterior(_) => panic!("expected a leaf page back"),
         }
@@ -294,6 +286,7 @@ mod tests {
     fn interior_page_round_trips_at_page_number_one() {
         const PAGE_SIZE: usize = 512;
         let pn1 = PageNumber::try_from(1).unwrap();
+        let ps = PageSpec::new(PAGE_SIZE, pn1);
 
         let original = TableInteriorPage {
             cells: vec![TableInteriorCell {
@@ -303,16 +296,14 @@ mod tests {
             rightmost_child: PageNumber::try_from(6).unwrap(),
         };
 
-        let bytes = Page::TableInterior(original.clone())
-            .serialize(pn1, PAGE_SIZE)
-            .unwrap();
+        let bytes = Page::TableInterior(original.clone()).serialize(ps).unwrap();
 
         assert_eq!(
             &bytes[0..MAZE_HEADER_SIZE],
             vec![0u8; MAZE_HEADER_SIZE].as_slice()
         );
 
-        match Page::parse(&bytes, pn1).unwrap() {
+        match Page::parse(&bytes, ps).unwrap() {
             Page::TableInterior(parsed) => assert_eq!(parsed, original),
             Page::TableLeaf(_) => panic!("expected an interior page back"),
         }

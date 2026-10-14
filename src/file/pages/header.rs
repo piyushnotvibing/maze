@@ -1,4 +1,8 @@
-use crate::file::pages::{PageType, bytes::{read_word_u16_be, read_word_u32_be}, types::PageNumber};
+use crate::file::pages::{
+    PageType,
+    bytes::{read_word_u16_be, read_word_u32_be},
+    types::PageNumber,
+};
 
 const PAGE_CELL_COUNT_OFFSET: usize = 1;
 const PAGE_CELL_CONTENT_OFFSET: usize = 3;

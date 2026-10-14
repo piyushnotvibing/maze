@@ -1,14 +1,17 @@
-use crate::file::pages::{PageType, bytes::read_word_u16_be, header::PageHeader};
-pub trait Cell {
+use crate::file::pages::{PageType, bytes::read_word_u16_be, header::PageHeader, spec::PageSpec};
+
+pub trait Cell: Sized {
     fn serialize(&self) -> Vec<u8>;
     fn encoded_len(&self) -> usize;
     fn sort_key(&self) -> u64;
+    fn parse(buf: &[u8], ps: PageSpec) -> anyhow::Result<Self>;
 }
 
-pub(crate) fn parse_cells<'a, C: Cell + TryFrom<&'a [u8], Error = anyhow::Error>>(
-    buf: &'a [u8],
+pub(crate) fn parse_cells<C: Cell>(
+    buf: &[u8],
     header: PageHeader,
     page_type: PageType,
+    ps: PageSpec,
 ) -> anyhow::Result<Vec<C>> {
     let cell_content_region_start = match header.cell_content_offset {
         0 => 65536usize,
@@ -37,9 +40,10 @@ pub(crate) fn parse_cells<'a, C: Cell + TryFrom<&'a [u8], Error = anyhow::Error>
                 )
             }
 
-            let res = C::try_from(
+            let res = C::parse(
                 buf.get(ptr..)
                     .ok_or_else(|| anyhow::anyhow!("cell out of bounds"))?,
+                ps,
             )?;
             let end = ptr
                 .checked_add(res.encoded_len())

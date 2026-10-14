@@ -16,8 +16,12 @@
 */
 
 use crate::file::{
-    header::MAZE_HEADER_SIZE,
-    pages::{Cell, PageHeader, PageNumber, PageType, bytes::read_word_u32_be, cell::parse_cells},
+    pages::{
+        Cell, PageNumber, PageType,
+        bytes::read_word_u32_be,
+        spec::PageSpec,
+        table::{SplitKind, TablePage, best_split},
+    },
     varint,
 };
 
@@ -42,125 +46,64 @@ impl TableInteriorPage {
             None => self.rightmost_child,
         }
     }
-
-    pub fn serialize(&self, page_number: PageNumber, page_size: usize) -> anyhow::Result<Vec<u8>> {
-        let mut prev_row_id: Option<u64> = None;
-        for cell in self.cells.iter() {
-            if let Some(prev_row_id) = prev_row_id
-                && cell.row_id <= prev_row_id
-            {
-                anyhow::bail!("interior page cells not in sorted order")
-            }
-            prev_row_id = Some(cell.row_id);
-        }
-
-        PageType::TableInterior.serialize(
-            page_number,
-            Some(self.rightmost_child),
-            &self.cells,
-            page_size,
-        )
-    }
-
-    pub fn insert(
-        &mut self,
-        new_cell: TableInteriorCell,
-        page_number: PageNumber,
-        page_size: usize,
-    ) -> anyhow::Result<()> {
-        let new_row_id = new_cell.row_id;
-        let insert_idx = self.cells.partition_point(|cell| cell.row_id < new_row_id);
-        if self
-            .cells
-            .get(insert_idx)
-            .is_some_and(|c| c.row_id == new_row_id)
-        {
-            anyhow::bail!("row_id {new_row_id} already exists")
-        }
-
-        if !self.fits(&new_cell, page_number, page_size) {
-            anyhow::bail!("new cell does not fit in this interior page")
-        }
-
-        self.cells.insert(insert_idx, new_cell);
-
-        Ok(())
-    }
-
-    pub fn fits(
-        &self,
-        new_cell: &TableInteriorCell,
-        page_number: PageNumber,
-        page_size: usize,
-    ) -> bool {
-        let (cell_count, total_cell_len) = (self.cells.len(), self.cell_len());
-
-        match page_number.get() {
-            1 => {
-                page_size
-                    >= MAZE_HEADER_SIZE
-                        + PageType::TableInterior.header_size()
-                        + 2 * (cell_count + 1)
-                        + (total_cell_len + new_cell.encoded_len())
-            }
-            _ => {
-                page_size
-                    >= PageType::TableInterior.header_size()
-                        + 2 * (cell_count + 1)
-                        + (total_cell_len + new_cell.encoded_len())
-            }
-        }
-    }
-
-    pub fn split(&mut self) -> anyhow::Result<(Self, u64)> {
-        let mid = self
-            .cells
-            .len()
-            .checked_div(2)
-            .ok_or_else(|| anyhow::anyhow!("gng idek how this errored don't ask"))?;
-
-        let mid_cell = self
-            .cells
-            .get(mid)
-            .ok_or_else(|| anyhow::anyhow!("this interior page has no cell in the middle?"))?;
-
-        let (divider, self_new_right) = (mid_cell.row_id, mid_cell.left_child);
-
-        let mut new_ip_cells = self.cells.split_off(mid);
-        let _ = new_ip_cells.remove(0);
-        let new_ip = Self::new(new_ip_cells, self.rightmost_child);
-
-        self.rightmost_child = self_new_right;
-
-        Ok((new_ip, divider))
-    }
-
-    fn cell_len(&self) -> usize {
-        self.cells
-            .iter()
-            .map(|cell| cell.encoded_len())
-            .sum::<usize>()
-    }
 }
 
-impl TryFrom<&[u8]> for TableInteriorPage {
-    type Error = anyhow::Error;
+impl TablePage for TableInteriorPage {
+    type C = TableInteriorCell;
+    const PAGE_TYPE: PageType = PageType::TableInterior;
 
-    fn try_from(buf: &[u8]) -> anyhow::Result<Self> {
-        let header = PageHeader::parse(buf, PageType::TableInterior)?;
-        if header.cell_count == 0 {
-            anyhow::bail!("interior page has no cells")
+    fn from_parts(
+        cells: Vec<TableInteriorCell>,
+        rightmost_child: Option<PageNumber>,
+    ) -> anyhow::Result<Self> {
+        let rightmost_child = rightmost_child
+            .ok_or_else(|| anyhow::anyhow!("interior page has no rightmost child"))?;
+        if cells.is_empty() {
+            anyhow::bail!("interior page has no cells");
         }
-        if header.rightmost_child.is_none() {
-            anyhow::bail!("interior page has no rightmost child")
-        }
-
-        let cells = parse_cells(buf, header, PageType::TableInterior)?;
-
         Ok(Self {
             cells,
-            rightmost_child: header.rightmost_child.unwrap(),
+            rightmost_child,
         })
+    }
+
+    fn cells(&self) -> &[TableInteriorCell] {
+        &self.cells
+    }
+
+    fn cells_mut(&mut self) -> &mut Vec<TableInteriorCell> {
+        &mut self.cells
+    }
+
+    fn rightmost_child(&self) -> Option<PageNumber> {
+        Some(self.rightmost_child)
+    }
+
+    fn split_with(
+        mut self,
+        new_cell: TableInteriorCell,
+        left: PageSpec,
+        right: PageSpec,
+    ) -> anyhow::Result<(Self, Self, u64)> {
+        self.insert_unchecked(new_cell)?;
+
+        let s = best_split(
+            &self.cell_costs(),
+            SplitKind::TableInteriorSplit,
+            Self::PAGE_TYPE.header_size(),
+            left.usable()?,
+            right.usable()?,
+        )
+        .ok_or_else(|| anyhow::anyhow!("interior page too small to split"))?;
+
+        let mut right_cells = self.cells.split_off(s);
+        let promoted = right_cells.remove(0); // leaves both halves
+        let right_page = Self {
+            cells: right_cells,
+            rightmost_child: self.rightmost_child,
+        };
+        self.rightmost_child = promoted.left_child; // promoted cell's subtree ends the left half
+        Ok((self, right_page, promoted.row_id))
     }
 }
 
@@ -194,12 +137,11 @@ impl Cell for TableInteriorCell {
     fn sort_key(&self) -> u64 {
         self.row_id
     }
-}
 
-impl TryFrom<&[u8]> for TableInteriorCell {
-    type Error = anyhow::Error;
-
-    fn try_from(buf: &[u8]) -> anyhow::Result<Self> {
+    /// ps is only needed here for conformity with the trait unfortunately.
+    /// it's real purpose is only served when overflow support is implemented
+    /// for table leaf pages.
+    fn parse(buf: &[u8], _ps: PageSpec) -> anyhow::Result<Self> {
         let left_child = PageNumber::try_from(read_word_u32_be(buf, 0)?)?;
         // &buf[4..] won't panic here because above line would've errored if buffer wasn't at least 4 bytes long
         let (row_id, _) =
@@ -215,6 +157,10 @@ mod tests {
     use crate::file::{header::MAZE_HEADER_SIZE, pages::Page};
 
     const PAGE_SIZE: usize = 512;
+    const PAGE_SPEC: PageSpec = PageSpec {
+        page_size: PAGE_SIZE,
+        first: false,
+    };
 
     fn pn(n: u32) -> PageNumber {
         PageNumber::try_from(n).unwrap()
@@ -267,7 +213,7 @@ mod tests {
     }
 
     fn assert_rejects(buf: &[u8]) {
-        assert!(TableInteriorPage::try_from(buf).is_err());
+        assert!(TableInteriorPage::parse(buf, PAGE_SPEC).is_err());
     }
 
     // ---------- valid pages ----------
@@ -278,7 +224,7 @@ mod tests {
         let cells = [(3, 100), (4, 300)];
         let (buf, _ptrs, _content_offset) = build_interior(0, &cells, 5);
 
-        let page = TableInteriorPage::try_from(buf.as_slice()).unwrap();
+        let page = TableInteriorPage::parse(buf.as_slice(), PAGE_SPEC).unwrap();
 
         assert_eq!(page.rightmost_child, pn(5));
         assert_eq!(page.cells.len(), cells.len());
@@ -303,7 +249,7 @@ mod tests {
         buf[9..11].copy_from_slice(&(b as u16).to_be_bytes());
         buf[11..13].copy_from_slice(&(a as u16).to_be_bytes());
 
-        let page = TableInteriorPage::try_from(buf.as_slice()).unwrap();
+        let page = TableInteriorPage::parse(buf.as_slice(), PAGE_SPEC).unwrap();
         assert_eq!(page.cells.len(), 2);
         assert_eq!(
             (page.cells[0].left_child, page.cells[0].row_id),
@@ -319,8 +265,9 @@ mod tests {
     fn page_enum_dispatches_to_interior() {
         // (page number, base offset): page 1 sits after the file header
         for (number, base) in [(1u32, MAZE_HEADER_SIZE), (2, 0)] {
+            let ps = PageSpec::new(PAGE_SIZE, pn(number));
             let (buf, _, _) = build_interior(base, &[(3, 100), (4, 300)], 5);
-            match Page::parse(&buf, pn(number)).unwrap() {
+            match Page::parse(&buf, ps).unwrap() {
                 Page::TableInterior(p) => {
                     assert_eq!(p.cells.len(), 2);
                     assert_eq!(p.rightmost_child, pn(5));

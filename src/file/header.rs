@@ -1,7 +1,7 @@
 pub const MAZE_HEADER_SIZE: usize = 15;
 const MAGIC_STR: &[u8] = b"Maze Format 1\0";
 const HEADER_PAGE_SIZE_OFFSET: usize = 14;
-const MAX_PAGE_SIZE: u32 = (u16::MAX as u32) + 1; // 65536
+const MAX_PAGE_SIZE: usize = (u16::MAX as usize) + 1; // 65536
 
 #[derive(Debug, Clone, Copy)]
 pub struct MazeHeader {
@@ -10,7 +10,7 @@ pub struct MazeHeader {
 }
 
 impl MazeHeader {
-    pub fn new(page_size: u32) -> anyhow::Result<Self> {
+    pub fn new(page_size: usize) -> anyhow::Result<Self> {
         let page_size_exp = PageSizeExp::try_from(page_size)?;
         Ok(Self { page_size_exp })
     }
@@ -62,10 +62,10 @@ impl PageSizeExp {
     }
 }
 
-impl TryFrom<u32> for PageSizeExp {
+impl TryFrom<usize> for PageSizeExp {
     type Error = anyhow::Error;
 
-    fn try_from(value: u32) -> anyhow::Result<Self> {
+    fn try_from(value: usize) -> anyhow::Result<Self> {
         if value > MAX_PAGE_SIZE {
             anyhow::bail!("invalid page size: too large")
         } else if !value.is_power_of_two() {

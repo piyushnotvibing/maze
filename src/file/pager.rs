@@ -1,16 +1,18 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
+    path::Path,
 };
 
 use crate::file::{
     header::{MAZE_HEADER_SIZE, MazeHeader},
-    pages::{PageType, leaf::TableLeafCell, types::PageNumber},
+    pages::{PageType, leaf::TableLeafCell, spec::PageSpec, types::PageNumber},
 };
 
 pub struct Pager {
-    pub page_size: u32, // [2^9 to 2^16]
+    pub header: MazeHeader,
+    pub page_size: usize, // [2^9 to 2^16]
     file: File,
     cache: HashMap<PageNumber, Vec<u8>>,
     dirty: HashSet<u32>,
@@ -27,9 +29,10 @@ impl Pager {
             .take(MAZE_HEADER_SIZE as u64)
             .read_to_end(&mut maze_header_bytes)?;
         let maze_header = MazeHeader::try_from(maze_header_bytes.as_slice())?;
-        let page_size = 2u32.pow(maze_header.page_size_exp.get() as u32);
+        let page_size = 2u32.pow(maze_header.page_size_exp.get() as u32) as usize;
 
         Ok(Self {
+            header: maze_header,
             file,
             page_size,
             cache: HashMap::new(),
@@ -38,30 +41,35 @@ impl Pager {
     }
 
     // for new database creation -> writes header bytes along with an empty table leaf page in page 1.
-    pub fn new(path: &str, page_size: u32) -> anyhow::Result<Self> {
+    pub fn new(path: &str, page_size: usize) -> anyhow::Result<Self> {
         let create_new_file = true;
         let mut file = open_rw(path, create_new_file)?;
 
+        let header = MazeHeader::new(page_size)?;
         let pn1 = PageNumber::try_from(1)?;
+        let ps = PageSpec::new(page_size as usize, pn1);
         let no_rightmost_child = None;
         let no_cells = Vec::<TableLeafCell>::new();
 
         // `PageType::serialize` already reserves the leading
         // `MAZE_HEADER_SIZE` bytes for page 1 (left zeroed) -- this is the
         // whole page_size-length page 1 buffer, not just its own page header.
-        let mut page1 =
-            PageType::TableLeaf.serialize(pn1, no_rightmost_child, &no_cells, page_size as usize)?;
-        let header = MazeHeader::new(page_size)?;
+        let mut page1 = PageType::TableLeaf.serialize(&no_cells, no_rightmost_child, ps)?;
         page1[0..MAZE_HEADER_SIZE].copy_from_slice(&header.serialize());
 
         write_page_to_disk(&mut file, page_size, pn1, &page1)?;
 
         Ok(Self {
+            header,
             file,
             page_size,
             cache: HashMap::new(),
             dirty: HashSet::new(),
         })
+    }
+
+    pub fn spec(&self, pn: PageNumber) -> PageSpec {
+        PageSpec::new(self.page_size as usize, pn)
     }
 
     pub fn get_page(&mut self, page_number: PageNumber) -> anyhow::Result<&[u8]> {
@@ -86,7 +94,17 @@ impl Pager {
         }
     }
 
-    pub fn write_page(&mut self, page_number: PageNumber, bytes: Vec<u8>) -> anyhow::Result<()> {
+    /// Assumes that the bytes for Maze header were accounted for in `bytes`, as this method will
+    /// write the header to bytes[0..MAZE_HEADER_SIZE]
+    pub fn write_page(
+        &mut self,
+        page_number: PageNumber,
+        mut bytes: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        if page_number == 1 {
+            bytes[0..MAZE_HEADER_SIZE].copy_from_slice(&self.header.serialize());
+        }
+
         write_page_to_disk(&mut self.file, self.page_size, page_number, &bytes)?;
         self.cache.insert(page_number, bytes);
         Ok(())
@@ -110,30 +128,38 @@ impl Pager {
 
 fn read_page_from_disk(
     file: &mut File,
-    page_size: u32,
+    page_size: usize,
     page_number: PageNumber,
 ) -> anyhow::Result<Vec<u8>> {
-    let file_offset = (page_number.get() - 1) * page_size;
-    file.seek(SeekFrom::Start(file_offset as u64))?;
-    let mut buf = vec![0u8; page_size as usize];
+    let file_offset = ((page_number.get() - 1) as u64) * page_size as u64;
+    file.seek(SeekFrom::Start(file_offset))?;
+    let mut buf = vec![0u8; page_size];
     file.read_exact(&mut buf)?;
     Ok(buf)
 }
 
 fn write_page_to_disk(
     file: &mut File,
-    page_size: u32,
+    page_size: usize,
     page_number: PageNumber,
     data: &[u8],
 ) -> anyhow::Result<()> {
-    let file_offset = (page_number.get() - 1) * page_size;
-    file.seek(SeekFrom::Start(file_offset as u64))?;
+    let file_offset = ((page_number.get() - 1) as u64) * page_size as u64;
+    file.seek(SeekFrom::Start(file_offset))?;
     file.write_all(data)?;
     Ok(())
 }
 
 fn open_rw(path: &str, create: bool) -> std::io::Result<File> {
     if create {
+        let path = Path::new(path);
+        if path.exists() {
+            return Err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                "File already exists",
+            ));
+        }
+
         return OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -165,8 +191,9 @@ mod tests {
         let mut pager = Pager::new(&path, 512).unwrap();
 
         let pn1 = PageNumber::try_from(1).unwrap();
+        let ps = PageSpec::new(512, pn1);
         let bytes = pager.get_page(pn1).unwrap().to_vec();
-        match Page::parse(&bytes, pn1).unwrap() {
+        match Page::parse(&bytes, ps).unwrap() {
             Page::TableLeaf(lp) => assert!(lp.cells.is_empty()),
             Page::TableInterior(_) => panic!("expected an empty leaf page as the fresh root"),
         }
@@ -185,8 +212,9 @@ mod tests {
         assert_eq!(reopened.page_size, 512);
 
         let pn1 = PageNumber::try_from(1).unwrap();
+        let ps = PageSpec::new(512, pn1);
         let bytes = reopened.get_page(pn1).unwrap().to_vec();
-        match Page::parse(&bytes, pn1).unwrap() {
+        match Page::parse(&bytes, ps).unwrap() {
             Page::TableLeaf(lp) => assert!(lp.cells.is_empty()),
             Page::TableInterior(_) => panic!("expected a leaf page"),
         }
