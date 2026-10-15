@@ -3,7 +3,7 @@ use crate::file::{
     pages::{
         Page,
         interior::{TableInteriorCell, TableInteriorPage},
-        leaf::{TableLeafCell, TableLeafPage},
+        leaf::TableLeafCell,
         spec::PageSpec,
         table::TablePage,
         types::PageNumber,
@@ -43,8 +43,11 @@ impl<'a> Cursor<'a> {
     pub fn delete(&mut self, row_id: u64) -> anyhow::Result<()> {
         match self.delete_from(self.root_pn, row_id)? {
             DeleteOutcome::Done => self.shrink_root(),
-            DeleteOutcome::DeletedChild => anyhow::bail!("root's child can't get deleted"),
-            DeleteOutcome::Collapsed { .. } => anyhow::bail!("root's child cannot collapse"),
+            DeleteOutcome::DeletedChild => {
+                anyhow::bail!(
+                    "root reported its own death: shrink_root should have kept it non-empty"
+                )
+            }
         }
     }
 
@@ -195,74 +198,14 @@ impl<'a> Cursor<'a> {
                     DeleteOutcome::Done => Ok(DeleteOutcome::Done),
                     DeleteOutcome::DeletedChild => {
                         if ip.cells().is_empty() {
-                            if page_number == self.root_pn {
-                                self.pager.write_page(
-                                    self.root_pn,
-                                    TableLeafPage::new(Vec::new())
-                                        .serialize(self.pager.spec(self.root_pn))?,
-                                )?;
-                                self.pager.free_page(child);
-                                return Ok(DeleteOutcome::Done);
-                            }
                             self.pager.free_page(child);
                             return Ok(DeleteOutcome::DeletedChild);
                         }
 
-                        match ip.delete_child(child)? {
-                            Some(survivor) => {
-                                if page_number == self.root_pn {
-                                    let survivor_bytes = self
-                                        .fetch_page(survivor)?
-                                        .serialize(self.pager.spec(self.root_pn))?;
-                                    self.pager.write_page(self.root_pn, survivor_bytes)?;
-                                    self.pager.free_page(survivor);
-                                    self.pager.free_page(child);
-                                    return Ok(DeleteOutcome::Done);
-                                }
-                                return Ok(DeleteOutcome::Collapsed {
-                                    collapsed_interior: page_number,
-                                    survivor,
-                                    orphan: child,
-                                });
-                            }
-                            None => {
-                                self.pager.write_page(
-                                    page_number,
-                                    ip.serialize(self.pager.spec(page_number))?,
-                                )?;
-                                self.pager.free_page(child);
-                            }
-                        }
-
-                        Ok(DeleteOutcome::Done)
-                    }
-                    DeleteOutcome::Collapsed {
-                        collapsed_interior,
-                        survivor,
-                        orphan,
-                    } => {
-                        if ip.cells().is_empty() {
-                            if collapsed_interior != child
-                                || ip.rightmost_child != collapsed_interior
-                            {
-                                anyhow::bail!(
-                                    "collapsed page {collapsed_interior} is not the sole child of {page_number}"
-                                );
-                            }
-
-                            self.pager.free_page(collapsed_interior);
-                            return Ok(DeleteOutcome::Collapsed {
-                                collapsed_interior: page_number,
-                                survivor,
-                                orphan,
-                            });
-                        }
-                        repoint_child(&mut ip, collapsed_interior, survivor)?;
+                        ip.delete_child(child)?;
                         self.pager
                             .write_page(page_number, ip.serialize(self.pager.spec(page_number))?)?;
-                        self.pager.free_page(collapsed_interior);
-                        self.pager.free_page(orphan);
-
+                        self.pager.free_page(child);
                         Ok(DeleteOutcome::Done)
                     }
                 }
@@ -319,11 +262,6 @@ enum InsertOutcome {
 enum DeleteOutcome {
     Done,
     DeletedChild,
-    Collapsed {
-        collapsed_interior: PageNumber,
-        survivor: PageNumber,
-        orphan: PageNumber,
-    },
 }
 
 #[cfg(test)]
@@ -730,5 +668,321 @@ mod tests {
             (stats.pages.len() as u64 + pager.leaked_pages().len() as u64) * PAGE_SIZE as u64,
             std::fs::metadata(&path).unwrap().len(), // every page in the file belongs to the tree
         );
+    }
+
+    #[test]
+    fn delete_removes_a_single_row_and_leaves_the_rest_reachable() {
+        let path = temp_db_path("delete_single");
+        let mut pager = build_tree(&path);
+        let mut cursor = Cursor::new(&mut pager, pn(1));
+
+        cursor.delete(100).unwrap();
+
+        assert_eq!(cursor.seek(100).unwrap(), None);
+        for &row_id in &[1u64, 2, 3, 10, 20, 30, 150, 500, 600, 700] {
+            assert_eq!(
+                cursor.seek(row_id).unwrap().map(|c| c.row_id),
+                Some(row_id),
+                "expected row {row_id} to still be reachable"
+            );
+        }
+        let scanned: Vec<u64> = cursor
+            .scan()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.row_id)
+            .collect();
+        assert_eq!(scanned, vec![1, 2, 3, 10, 20, 30, 150, 500, 600, 700]);
+
+        check_tree(&mut pager, pn(1)).unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    // `build_tree`'s mid1 (page 5) has cell {left_child: 10, row_id: 3} plus
+    // rightmost_child: 11 -- draining leaf 10 removes a *cell*, leaving
+    // rightmost_child untouched. This is the code path the original bug's
+    // `repoint_child(&mut grandparent, collapsed, survivor)` call handled
+    // incorrectly when it fired at all; this test pins down that the
+    // collapsed page now persists in place instead.
+    #[test]
+    fn draining_a_child_reached_via_a_cell_leaves_a_degenerate_sibling_with_rightmost_unchanged() {
+        let path = temp_db_path("collapse_left_cell");
+        let mut pager = build_tree(&path);
+        {
+            let mut cursor = Cursor::new(&mut pager, pn(1));
+            for row_id in [1u64, 2, 3] {
+                cursor.delete(row_id).unwrap();
+            }
+
+            let scanned: Vec<u64> = cursor
+                .scan()
+                .unwrap()
+                .into_iter()
+                .map(|c| c.row_id)
+                .collect();
+            assert_eq!(scanned, vec![10, 20, 30, 100, 150, 500, 600, 700]);
+        }
+
+        let page5_bytes = pager.get_page(pn(5)).unwrap().to_vec();
+        match Page::parse(&page5_bytes, pager.spec(pn(5))).unwrap() {
+            Page::TableInterior(ip) => {
+                assert!(ip.cells.is_empty(), "page 5 should now be degenerate");
+                assert_eq!(
+                    ip.rightmost_child,
+                    pn(11),
+                    "rightmost_child must be untouched by a cell-side collapse"
+                );
+            }
+            Page::TableLeaf(_) => panic!("page 5 should still be an interior page"),
+        }
+
+        let stats = check_tree(&mut pager, pn(1)).unwrap();
+        assert_eq!(stats.depth, 2, "tree must not have shrunk");
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Mirror of the test above, but draining leaf 11 -- reached via mid1's
+    // `rightmost_child`, not a cell. `delete_child` must pop the one
+    // remaining cell and promote its `left_child` into `rightmost_child`.
+    #[test]
+    fn draining_a_child_reached_via_rightmost_promotes_the_last_cell_into_rightmost() {
+        let path = temp_db_path("collapse_rightmost");
+        let mut pager = build_tree(&path);
+        {
+            let mut cursor = Cursor::new(&mut pager, pn(1));
+            for row_id in [10u64, 20, 30] {
+                cursor.delete(row_id).unwrap();
+            }
+
+            let scanned: Vec<u64> = cursor
+                .scan()
+                .unwrap()
+                .into_iter()
+                .map(|c| c.row_id)
+                .collect();
+            assert_eq!(scanned, vec![1, 2, 3, 100, 150, 500, 600, 700]);
+        }
+
+        let page5_bytes = pager.get_page(pn(5)).unwrap().to_vec();
+        match Page::parse(&page5_bytes, pager.spec(pn(5))).unwrap() {
+            Page::TableInterior(ip) => {
+                assert!(ip.cells.is_empty(), "page 5 should now be degenerate");
+                assert_eq!(
+                    ip.rightmost_child,
+                    pn(10),
+                    "rightmost_child must be promoted from the popped cell's left_child"
+                );
+            }
+            Page::TableLeaf(_) => panic!("page 5 should still be an interior page"),
+        }
+
+        let stats = check_tree(&mut pager, pn(1)).unwrap();
+        assert_eq!(stats.depth, 2, "tree must not have shrunk");
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Drains BOTH of mid1's children in sequence: the second drain hits
+    // mid1 while it's *already* degenerate from the first drain, which is
+    // the exact case that needs the "if ip.cells() is already empty, don't
+    // call delete_child, just propagate my own death" branch -- without
+    // it this either panics (popping an empty Vec) or errors on a guard.
+    // The root then genuinely loses a level via `shrink_root`.
+    #[test]
+    fn draining_both_children_of_a_mid_node_shrinks_the_tree_by_one_level() {
+        let path = temp_db_path("collapse_both_children");
+        let mut pager = build_tree(&path);
+        {
+            let mut cursor = Cursor::new(&mut pager, pn(1));
+            for row_id in [1u64, 2, 3, 10, 20, 30] {
+                cursor.delete(row_id).unwrap();
+            }
+
+            let scanned: Vec<u64> = cursor
+                .scan()
+                .unwrap()
+                .into_iter()
+                .map(|c| c.row_id)
+                .collect();
+            assert_eq!(scanned, vec![100, 150, 500, 600, 700]);
+        }
+
+        // page 1 (root) now holds what used to be mid2's (page 6) content.
+        let root_bytes = pager.get_page(pn(1)).unwrap().to_vec();
+        match Page::parse(&root_bytes, pager.spec(pn(1))).unwrap() {
+            Page::TableInterior(ip) => {
+                assert_eq!(ip.cells.len(), 1);
+                assert_eq!(ip.cells[0].left_child, pn(12));
+                assert_eq!(ip.cells[0].row_id, 150);
+                assert_eq!(ip.rightmost_child, pn(13));
+            }
+            Page::TableLeaf(_) => panic!("root should still be an interior page"),
+        }
+
+        let stats = check_tree(&mut pager, pn(1)).unwrap();
+        assert_eq!(stats.depth, 1, "tree must have shrunk by exactly one level");
+
+        let leaked: std::collections::HashSet<PageNumber> =
+            pager.leaked_pages().iter().copied().collect();
+        let expected: std::collections::HashSet<PageNumber> =
+            [pn(5), pn(6), pn(10), pn(11)].into_iter().collect();
+        // Note: no live-pages + leaked-pages == file-size check here, unlike
+        // `ensure_5000_row_tree_stats_are_correct` -- `build_tree` writes at
+        // hand-picked page numbers (10-13) directly, never through
+        // `Pager::allocate_page()`, so the file is sparse (pages 2-4 and
+        // 7-9 were never allocated at all) and that byte-accounting
+        // invariant doesn't apply to this fixture. The set equality below
+        // is the real assertion.
+        assert_eq!(leaked, expected);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Hand-builds a chain of TWO stacked degenerate interior pages (3 -> 4,
+    // both 0 cells) hanging off root's rightmost_child, with root's one
+    // cell pointing at an unrelated small leaf. Draining that small leaf
+    // makes root itself degenerate, forcing `shrink_root`'s loop to walk
+    // through page 3, then page 4 (also degenerate), before finally
+    // promoting leaf 7's actual rows into the root -- exercising the loop
+    // as a loop, not just a single `if`.
+    #[test]
+    fn shrink_root_walks_through_a_stack_of_degenerate_interior_pages() {
+        let path = temp_db_path("stacked_shrink");
+        let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
+
+        write_leaf(&mut pager, pn(2), &[1, 2, 3, 4, 5]);
+        write_leaf(&mut pager, pn(7), &[10, 20, 30]);
+        write_interior(&mut pager, pn(4), TableInteriorPage::new(Vec::new(), pn(7)));
+        write_interior(&mut pager, pn(3), TableInteriorPage::new(Vec::new(), pn(4)));
+        write_interior(
+            &mut pager,
+            pn(1),
+            TableInteriorPage::new(
+                vec![TableInteriorCell {
+                    left_child: pn(2),
+                    row_id: 5,
+                }],
+                pn(3),
+            ),
+        );
+
+        {
+            let mut cursor = Cursor::new(&mut pager, pn(1));
+            for row_id in 1u64..=5 {
+                cursor.delete(row_id).unwrap();
+            }
+
+            let scanned: Vec<u64> = cursor
+                .scan()
+                .unwrap()
+                .into_iter()
+                .map(|c| c.row_id)
+                .collect();
+            assert_eq!(scanned, vec![10, 20, 30]);
+        }
+
+        // root collapsed all the way down to what used to be leaf 7.
+        let root_bytes = pager.get_page(pn(1)).unwrap().to_vec();
+        match Page::parse(&root_bytes, pager.spec(pn(1))).unwrap() {
+            Page::TableLeaf(lp) => {
+                let ids: Vec<u64> = lp.cells.iter().map(|c| c.row_id).collect();
+                assert_eq!(ids, vec![10, 20, 30]);
+            }
+            Page::TableInterior(_) => panic!("root should have collapsed all the way to a leaf"),
+        }
+
+        let stats = check_tree(&mut pager, pn(1)).unwrap();
+        assert_eq!(stats.depth, 0);
+        assert_eq!(stats.rows, 3);
+
+        let leaked: std::collections::HashSet<PageNumber> =
+            pager.leaked_pages().iter().copied().collect();
+        let expected: std::collections::HashSet<PageNumber> =
+            [pn(2), pn(3), pn(4), pn(7)].into_iter().collect();
+        assert_eq!(leaked, expected);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_of_missing_row_errors_and_leaves_tree_unchanged() {
+        let path = temp_db_path("delete_missing");
+        let mut pager = build_tree(&path);
+        let mut cursor = Cursor::new(&mut pager, pn(1));
+
+        let size_before = std::fs::metadata(&path).unwrap().len();
+        let scan_before: Vec<u64> = cursor
+            .scan()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.row_id)
+            .collect();
+
+        assert!(cursor.delete(999).is_err());
+
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size_before);
+        let scan_after: Vec<u64> = cursor
+            .scan()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.row_id)
+            .collect();
+        assert_eq!(scan_after, scan_before);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn insert_then_delete_shuffled_matches_reference_model() {
+        let path = temp_db_path("insert_delete_shuffled");
+        let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
+
+        let n = 2000u64;
+        let insert_order = shuffled(n);
+        let mut delete_order = shuffled(n);
+        delete_order.reverse(); // deterministic, but a different order than insertion
+
+        let mut model: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        {
+            let mut cursor = Cursor::new(&mut pager, pn(1));
+            for &k in &insert_order {
+                cursor.insert(k, &k.to_be_bytes()).unwrap();
+                model.insert(k);
+            }
+            let scanned: Vec<u64> = cursor
+                .scan()
+                .unwrap()
+                .into_iter()
+                .map(|c| c.row_id)
+                .collect();
+            assert_eq!(scanned, model.iter().copied().collect::<Vec<u64>>());
+        }
+
+        for &k in &delete_order {
+            {
+                let mut cursor = Cursor::new(&mut pager, pn(1));
+                cursor.delete(k).unwrap();
+            }
+            model.remove(&k);
+
+            let scanned: Vec<u64> = {
+                let mut cursor = Cursor::new(&mut pager, pn(1));
+                cursor
+                    .scan()
+                    .unwrap()
+                    .into_iter()
+                    .map(|c| c.row_id)
+                    .collect()
+            };
+            assert_eq!(
+                scanned,
+                model.iter().copied().collect::<Vec<u64>>(),
+                "mismatch after deleting {k}"
+            );
+
+            check_tree(&mut pager, pn(1)).unwrap();
+        }
+
+        assert!(model.is_empty());
+        std::fs::remove_file(&path).ok();
     }
 }

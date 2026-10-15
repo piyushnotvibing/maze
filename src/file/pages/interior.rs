@@ -47,13 +47,7 @@ impl TableInteriorPage {
         }
     }
 
-    /// Deletes a child table page. Returns the page number of rightmost child of an empty page
-    /// that should be inserted into parent.
-    pub fn delete_child(&mut self, child: PageNumber) -> anyhow::Result<Option<PageNumber>> {
-        if self.cells.is_empty() {
-            anyhow::bail!("interior page is empty")
-        }
-        
+    pub fn delete_child(&mut self, child: PageNumber) -> anyhow::Result<()> {
         let child_idx = self.cells.iter().position(|cell| cell.left_child == child);
         match child_idx {
             Some(idx) => {
@@ -66,11 +60,7 @@ impl TableInteriorPage {
             None => anyhow::bail!("interior page does not contain child page {child}"),
         }
 
-        if self.cells.is_empty() {
-            return Ok(Some(self.rightmost_child))
-        }
-
-        Ok(None)
+        Ok(())
     }
 }
 
@@ -84,10 +74,6 @@ impl TablePage for TableInteriorPage {
     ) -> anyhow::Result<Self> {
         let rightmost_child = rightmost_child
             .ok_or_else(|| anyhow::anyhow!("interior page has no rightmost child"))?;
-
-        if cells.is_empty() {
-            anyhow::bail!("interior page has no cells");
-        }
 
         Ok(Self {
             cells,

@@ -33,9 +33,9 @@ pub(crate) trait TablePage: Sized {
     }
 
     fn rightmost_child(&self) -> Option<PageNumber>;
-    
+
     /*=========================== Provided Methods ===========================*/
-    
+
     fn used_bytes(&self) -> usize {
         Self::PAGE_TYPE.header_size() + self.cell_costs().iter().sum::<usize>()
     }

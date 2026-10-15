@@ -137,7 +137,7 @@ impl Pager {
     pub fn leaked_pages(&self) -> &[PageNumber] {
         &self.leaked
     }
-} 
+}
 
 fn read_page_from_disk(
     file: &mut File,
