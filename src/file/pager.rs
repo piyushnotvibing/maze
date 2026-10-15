@@ -47,7 +47,7 @@ impl Pager {
 
         let header = MazeHeader::new(page_size)?;
         let pn1 = PageNumber::try_from(1)?;
-        let ps = PageSpec::new(page_size as usize, pn1);
+        let ps = PageSpec::new(page_size, pn1);
         let no_rightmost_child = None;
         let no_cells = Vec::<TableLeafCell>::new();
 
@@ -69,7 +69,7 @@ impl Pager {
     }
 
     pub fn spec(&self, pn: PageNumber) -> PageSpec {
-        PageSpec::new(self.page_size as usize, pn)
+        PageSpec::new(self.page_size, pn)
     }
 
     pub fn get_page(&mut self, page_number: PageNumber) -> anyhow::Result<&[u8]> {
@@ -121,7 +121,7 @@ impl Pager {
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("can't add 1 to filesize/pagesize"))?,
         )?)?;
-        self.write_page(new_pn, vec![0u8; self.page_size as usize])?;
+        self.write_page(new_pn, vec![0u8; self.page_size])?;
         Ok(new_pn)
     }
 }

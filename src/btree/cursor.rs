@@ -102,7 +102,7 @@ impl<'a> Cursor<'a> {
             Page::TableInterior(mut ip) => {
                 let next = ip.child_of(row_id);
                 match self.insert_into(next, row_id, payload)? {
-                    InsertOutcome::Done => return Ok(InsertOutcome::Done),
+                    InsertOutcome::Done => Ok(InsertOutcome::Done),
                     InsertOutcome::Split {
                         old_child,
                         new_child,
@@ -133,7 +133,7 @@ impl<'a> Cursor<'a> {
         }
 
         // a new page is never page 1
-        let right_spec = PageSpec::fresh(self.pager.page_size as usize);
+        let right_spec = PageSpec::fresh(self.pager.page_size);
         let (left, right, divider) = page.split_with(new_cell, spec, right_spec)?;
 
         let left_bytes = left.serialize(spec)?;
