@@ -24,6 +24,17 @@ impl TableLeafPage {
             .binary_search_by_key(&row_id, |cell| cell.row_id)
             .is_ok()
     }
+
+    pub fn delete(&mut self, row_id: u64) -> anyhow::Result<TableLeafCell> {
+        let delete_idx = self.cells.binary_search_by_key(&row_id, |cell| cell.row_id);
+        if delete_idx.is_err() {
+            anyhow::bail!("cannot delete row_id {row_id} that does not exist in the tree")
+        }
+        let delete_idx = delete_idx.unwrap();
+        let deleted = self.cells.remove(delete_idx);
+
+        Ok(deleted)
+    }
 }
 
 impl TablePage for TableLeafPage {

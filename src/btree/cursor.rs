@@ -3,7 +3,7 @@ use crate::file::{
     pages::{
         Page,
         interior::{TableInteriorCell, TableInteriorPage},
-        leaf::TableLeafCell,
+        leaf::{TableLeafCell, TableLeafPage},
         spec::PageSpec,
         table::TablePage,
         types::PageNumber,
@@ -37,6 +37,14 @@ impl<'a> Cursor<'a> {
             InsertOutcome::Split {
                 new_child, divider, ..
             } => self.split_root(new_child, divider),
+        }
+    }
+
+    pub fn delete(&mut self, row_id: u64) -> anyhow::Result<()> {
+        match self.delete_from(self.root_pn, row_id)? {
+            DeleteOutcome::Done => self.shrink_root(),
+            DeleteOutcome::DeletedChild => anyhow::bail!("root's child can't get deleted"),
+            DeleteOutcome::Collapsed { .. } => anyhow::bail!("root's child cannot collapse"),
         }
     }
 
@@ -165,6 +173,121 @@ impl<'a> Cursor<'a> {
         // write_page stamps the header when root_pn == 1
         self.pager.write_page(root_pn, new_root_bytes)
     }
+
+    fn delete_from(
+        &mut self,
+        page_number: PageNumber,
+        row_id: u64,
+    ) -> anyhow::Result<DeleteOutcome> {
+        match self.fetch_page(page_number)? {
+            Page::TableLeaf(mut lp) => {
+                lp.delete(row_id)?;
+                if lp.cells().is_empty() && page_number != self.root_pn {
+                    return Ok(DeleteOutcome::DeletedChild);
+                }
+                self.pager
+                    .write_page(page_number, lp.serialize(self.pager.spec(page_number))?)?;
+                Ok(DeleteOutcome::Done)
+            }
+            Page::TableInterior(mut ip) => {
+                let child = ip.child_of(row_id);
+                match self.delete_from(child, row_id)? {
+                    DeleteOutcome::Done => Ok(DeleteOutcome::Done),
+                    DeleteOutcome::DeletedChild => {
+                        if ip.cells().is_empty() {
+                            if page_number == self.root_pn {
+                                self.pager.write_page(
+                                    self.root_pn,
+                                    TableLeafPage::new(Vec::new())
+                                        .serialize(self.pager.spec(self.root_pn))?,
+                                )?;
+                                self.pager.free_page(child);
+                                return Ok(DeleteOutcome::Done);
+                            }
+                            self.pager.free_page(child);
+                            return Ok(DeleteOutcome::DeletedChild);
+                        }
+
+                        match ip.delete_child(child)? {
+                            Some(survivor) => {
+                                if page_number == self.root_pn {
+                                    let survivor_bytes = self
+                                        .fetch_page(survivor)?
+                                        .serialize(self.pager.spec(self.root_pn))?;
+                                    self.pager.write_page(self.root_pn, survivor_bytes)?;
+                                    self.pager.free_page(survivor);
+                                    self.pager.free_page(child);
+                                    return Ok(DeleteOutcome::Done);
+                                }
+                                return Ok(DeleteOutcome::Collapsed {
+                                    collapsed_interior: page_number,
+                                    survivor,
+                                    orphan: child,
+                                });
+                            }
+                            None => {
+                                self.pager.write_page(
+                                    page_number,
+                                    ip.serialize(self.pager.spec(page_number))?,
+                                )?;
+                                self.pager.free_page(child);
+                            }
+                        }
+
+                        Ok(DeleteOutcome::Done)
+                    }
+                    DeleteOutcome::Collapsed {
+                        collapsed_interior,
+                        survivor,
+                        orphan,
+                    } => {
+                        if ip.cells().is_empty() {
+                            if collapsed_interior != child
+                                || ip.rightmost_child != collapsed_interior
+                            {
+                                anyhow::bail!(
+                                    "collapsed page {collapsed_interior} is not the sole child of {page_number}"
+                                );
+                            }
+
+                            self.pager.free_page(collapsed_interior);
+                            return Ok(DeleteOutcome::Collapsed {
+                                collapsed_interior: page_number,
+                                survivor,
+                                orphan,
+                            });
+                        }
+                        repoint_child(&mut ip, collapsed_interior, survivor)?;
+                        self.pager
+                            .write_page(page_number, ip.serialize(self.pager.spec(page_number))?)?;
+                        self.pager.free_page(collapsed_interior);
+                        self.pager.free_page(orphan);
+
+                        Ok(DeleteOutcome::Done)
+                    }
+                }
+            }
+        }
+    }
+
+    fn shrink_root(&mut self) -> anyhow::Result<()> {
+        loop {
+            let root = self.fetch_page(self.root_pn)?;
+            match root {
+                Page::TableLeaf(_) => return Ok(()),
+                Page::TableInterior(ip) if !ip.cells().is_empty() => return Ok(()),
+                Page::TableInterior(root_ip) => {
+                    let right_child = root_ip.rightmost_child;
+                    let root_right_child_bytes = self
+                        .fetch_page(right_child)?
+                        .serialize(self.pager.spec(self.root_pn))?;
+                    self.pager
+                        .write_page(self.root_pn, root_right_child_bytes)?;
+                    self.pager.free_page(right_child);
+                }
+            }
+        }
+    }
 }
 
 fn repoint_child(
@@ -190,6 +313,16 @@ enum InsertOutcome {
         old_child: PageNumber,
         new_child: PageNumber,
         divider: u64,
+    },
+}
+
+enum DeleteOutcome {
+    Done,
+    DeletedChild,
+    Collapsed {
+        collapsed_interior: PageNumber,
+        survivor: PageNumber,
+        orphan: PageNumber,
     },
 }
 
@@ -593,7 +726,8 @@ mod tests {
         let stats = check_tree(&mut pager, pn(1)).unwrap();
         assert_eq!(stats.rows, 5000);
         assert_eq!(
-            stats.pages.len() as u64 * PAGE_SIZE as u64,
+            // ( pages in tree        + pages leaked                     ) * size of a page = size of the database file.
+            (stats.pages.len() as u64 + pager.leaked_pages().len() as u64) * PAGE_SIZE as u64,
             std::fs::metadata(&path).unwrap().len(), // every page in the file belongs to the tree
         );
     }

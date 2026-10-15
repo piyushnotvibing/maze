@@ -40,3 +40,14 @@ Database header size = 15B (as of now)
 
 ## b-tree Page Cells
 - A cell's (interior or leaf page cell) `row_id` can be 0. The first cell's `row_id` must be 0.
+
+# Row Deletion Policy
+1. non-root leaf pages are allowed to as little as one cell, its okay.
+2. as soon as it loses that single cell, it gets deleted (freed). 
+    - similarly a non-root interior page with no children is deleted.
+    - root never disappears
+3. a non-root interior page may have zero cells (need to make changes in code for this)
+4. deleting a missing key returns an error
+5. freed pages are leaked for now (next subproject reclaims them in the freelist)
+
+- repacking reclaims inter-page holes in disk, so that is already covered. 

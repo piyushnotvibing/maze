@@ -13,6 +13,7 @@ use crate::file::{
 pub struct Pager {
     pub header: MazeHeader,
     pub page_size: usize, // [2^9 to 2^16]
+    pub leaked: Vec<PageNumber>,
     file: File,
     cache: HashMap<PageNumber, Vec<u8>>,
     dirty: HashSet<u32>,
@@ -35,6 +36,7 @@ impl Pager {
             header: maze_header,
             file,
             page_size,
+            leaked: Vec::new(),
             cache: HashMap::new(),
             dirty: HashSet::new(),
         })
@@ -63,6 +65,7 @@ impl Pager {
             header,
             file,
             page_size,
+            leaked: Vec::new(),
             cache: HashMap::new(),
             dirty: HashSet::new(),
         })
@@ -124,7 +127,17 @@ impl Pager {
         self.write_page(new_pn, vec![0u8; self.page_size])?;
         Ok(new_pn)
     }
-}
+
+    /// Adds a page to the leaked list (for now).
+    pub fn free_page(&mut self, freed_pn: PageNumber) {
+        self.leaked.push(freed_pn);
+    }
+
+    /// Returns an immutable reference to the list of leaked pages.
+    pub fn leaked_pages(&self) -> &[PageNumber] {
+        &self.leaked
+    }
+} 
 
 fn read_page_from_disk(
     file: &mut File,

@@ -46,6 +46,32 @@ impl TableInteriorPage {
             None => self.rightmost_child,
         }
     }
+
+    /// Deletes a child table page. Returns the page number of rightmost child of an empty page
+    /// that should be inserted into parent.
+    pub fn delete_child(&mut self, child: PageNumber) -> anyhow::Result<Option<PageNumber>> {
+        if self.cells.is_empty() {
+            anyhow::bail!("interior page is empty")
+        }
+        
+        let child_idx = self.cells.iter().position(|cell| cell.left_child == child);
+        match child_idx {
+            Some(idx) => {
+                self.cells.remove(idx);
+            }
+            None if self.rightmost_child == child => {
+                let last_cell = self.cells.pop().unwrap();
+                self.rightmost_child = last_cell.left_child;
+            }
+            None => anyhow::bail!("interior page does not contain child page {child}"),
+        }
+
+        if self.cells.is_empty() {
+            return Ok(Some(self.rightmost_child))
+        }
+
+        Ok(None)
+    }
 }
 
 impl TablePage for TableInteriorPage {
@@ -58,9 +84,11 @@ impl TablePage for TableInteriorPage {
     ) -> anyhow::Result<Self> {
         let rightmost_child = rightmost_child
             .ok_or_else(|| anyhow::anyhow!("interior page has no rightmost child"))?;
+
         if cells.is_empty() {
             anyhow::bail!("interior page has no cells");
         }
+
         Ok(Self {
             cells,
             rightmost_child,
@@ -298,10 +326,16 @@ mod tests {
         assert_rejects(&buf);
     }
 
+    // #[test]
+    // fn rejects_zero_cells() {
+    //     let (buf, _, _) = build_interior(0, &[], 5);
+    //     assert_rejects(&buf);
+    // }
+
     #[test]
-    fn rejects_zero_cells() {
+    fn accepts_zero_cells() {
         let (buf, _, _) = build_interior(0, &[], 5);
-        assert_rejects(&buf);
+        assert!(TableInteriorPage::parse(&buf, PAGE_SPEC).is_ok());
     }
 
     #[test]
