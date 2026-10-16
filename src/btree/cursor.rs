@@ -198,14 +198,14 @@ impl<'a> Cursor<'a> {
                     DeleteOutcome::Done => Ok(DeleteOutcome::Done),
                     DeleteOutcome::DeletedChild => {
                         if ip.cells().is_empty() {
-                            self.pager.free_page(child);
+                            self.pager.free_page(child)?;
                             return Ok(DeleteOutcome::DeletedChild);
                         }
 
                         ip.delete_child(child)?;
                         self.pager
                             .write_page(page_number, ip.serialize(self.pager.spec(page_number))?)?;
-                        self.pager.free_page(child);
+                        self.pager.free_page(child)?;
                         Ok(DeleteOutcome::Done)
                     }
                 }
@@ -226,7 +226,7 @@ impl<'a> Cursor<'a> {
                         .serialize(self.pager.spec(self.root_pn))?;
                     self.pager
                         .write_page(self.root_pn, root_right_child_bytes)?;
-                    self.pager.free_page(right_child);
+                    self.pager.free_page(right_child)?;
                 }
             }
         }
@@ -665,7 +665,7 @@ mod tests {
         assert_eq!(stats.rows, 5000);
         assert_eq!(
             // ( pages in tree        + pages leaked                     ) * size of a page = size of the database file.
-            (stats.pages.len() as u64 + pager.leaked_pages().len() as u64) * PAGE_SIZE as u64,
+            (stats.pages.len() as u64 + pager.count_fp().unwrap() as u64) * PAGE_SIZE as u64,
             std::fs::metadata(&path).unwrap().len(), // every page in the file belongs to the tree
         );
     }
@@ -822,7 +822,7 @@ mod tests {
         assert_eq!(stats.depth, 1, "tree must have shrunk by exactly one level");
 
         let leaked: std::collections::HashSet<PageNumber> =
-            pager.leaked_pages().iter().copied().collect();
+            pager.list_fp().unwrap().into_iter().collect();
         let expected: std::collections::HashSet<PageNumber> =
             [pn(5), pn(6), pn(10), pn(11)].into_iter().collect();
         // Note: no live-pages + leaked-pages == file-size check here, unlike
@@ -895,7 +895,7 @@ mod tests {
         assert_eq!(stats.rows, 3);
 
         let leaked: std::collections::HashSet<PageNumber> =
-            pager.leaked_pages().iter().copied().collect();
+            pager.list_fp().unwrap().into_iter().collect();
         let expected: std::collections::HashSet<PageNumber> =
             [pn(2), pn(3), pn(4), pn(7)].into_iter().collect();
         assert_eq!(leaked, expected);
@@ -983,6 +983,66 @@ mod tests {
         }
 
         assert!(model.is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn splits_reuse_freed_pages_without_growing_the_file() {
+        let path = temp_db_path("split_reuse");
+        let mut pager = build_tree(&path);
+        // Collapse both of mid1's children: frees pages 5, 6, 10, 11
+        // (same shape as `draining_both_children_of_a_mid_node_...`).
+        {
+            let mut cursor = Cursor::new(&mut pager, pn(1));
+            for row_id in [1u64, 2, 3, 10, 20, 30] {
+                cursor.delete(row_id).unwrap();
+            }
+        }
+        let free_before: std::collections::HashSet<PageNumber> =
+            pager.list_fp().unwrap().into_iter().collect();
+        assert_eq!(free_before.len(), 4);
+        let count_before = pager.header.free_page_count;
+        let size_before = std::fs::metadata(&path).unwrap().len();
+
+        // 400B payloads overflow a 512B leaf almost immediately, forcing
+        // splits. Each split must pop the freelist, never extend the file.
+        let mut inserted = Vec::new();
+        let mut reused = false;
+        for i in 0u64..12 {
+            let row_id = 1000 + i;
+            Cursor::new(&mut pager, pn(1))
+                .insert(row_id, &vec![0xABu8; 400])
+                .unwrap();
+            inserted.push(row_id);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                size_before,
+                "split grew the file while the freelist was nonempty"
+            );
+            if pager.header.free_page_count < count_before {
+                reused = true;
+                break;
+            }
+        }
+        assert!(reused, "expected a split to consume a freed page");
+        assert_eq!(
+            pager.header.free_page_count as usize,
+            pager.count_fp().unwrap(),
+            "header count must match the walked chain"
+        );
+
+        // Old rows plus new rows are all reachable, tree invariants hold.
+        let scanned: Vec<u64> = Cursor::new(&mut pager, pn(1))
+            .scan()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.row_id)
+            .collect();
+        let mut expected = vec![100, 150, 500, 600, 700];
+        expected.extend_from_slice(&inserted);
+        assert_eq!(scanned, expected);
+        check_tree(&mut pager, pn(1)).unwrap();
+
         std::fs::remove_file(&path).ok();
     }
 }

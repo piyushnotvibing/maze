@@ -1,3 +1,5 @@
+pub mod freelist;
+
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
@@ -6,14 +8,14 @@ use std::{
 };
 
 use crate::file::{
-    header::{MAZE_HEADER_SIZE, MazeHeader},
+    header::{MAX_PAGE_COUNT, MAZE_HEADER_SIZE, MazeHeader},
     pages::{PageType, leaf::TableLeafCell, spec::PageSpec, types::PageNumber},
 };
 
 pub struct Pager {
     pub header: MazeHeader,
     pub page_size: usize, // [2^9 to 2^16]
-    pub leaked: Vec<PageNumber>,
+
     file: File,
     cache: HashMap<PageNumber, Vec<u8>>,
     dirty: HashSet<u32>,
@@ -32,11 +34,26 @@ impl Pager {
         let maze_header = MazeHeader::try_from(maze_header_bytes.as_slice())?;
         let page_size = 2u32.pow(maze_header.page_size_exp.get() as u32) as usize;
 
+        if maze_header.first_freelist_trunk_pn.is_none() && maze_header.free_page_count > 0 {
+            anyhow::bail!(
+                "how can first freelist trunk page be null and count of free pages be more than 0?"
+            )
+        }
+        if maze_header.first_freelist_trunk_pn.is_some() && maze_header.free_page_count == 0 {
+            anyhow::bail!(
+                "how can first freelist trunk page be present but count of free pages be 0?"
+            )
+        }
+        if let Some(head_pn) = maze_header.first_freelist_trunk_pn
+            && head_pn == 1
+        {
+            anyhow::bail!("first page of the database cannot be a freelist trunk page")
+        }
+
         Ok(Self {
             header: maze_header,
             file,
             page_size,
-            leaked: Vec::new(),
             cache: HashMap::new(),
             dirty: HashSet::new(),
         })
@@ -65,7 +82,6 @@ impl Pager {
             header,
             file,
             page_size,
-            leaked: Vec::new(),
             cache: HashMap::new(),
             dirty: HashSet::new(),
         })
@@ -113,29 +129,43 @@ impl Pager {
         Ok(())
     }
 
-    /// Creates a page buffer, writes it to disk and cache, returns mutable reference of the page buffer in cache.
+    /// If a free page is available, initializes it to all zeros, returns its page number.
+    /// Else allocates a new page, initializes it to all zeros and returns its page number.
     pub fn allocate_page(&mut self) -> anyhow::Result<PageNumber> {
-        let new_pn = PageNumber::try_from(u32::try_from(
-            self.file
-                .metadata()?
-                .len()
-                .checked_div(self.page_size as u64)
-                .ok_or_else(|| anyhow::anyhow!("can't divide file size by page size"))?
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("can't add 1 to filesize/pagesize"))?,
-        )?)?;
-        self.write_page(new_pn, vec![0u8; self.page_size])?;
-        Ok(new_pn)
+        match self.get_fp()? {
+            Some(free_pn) => Ok(free_pn),
+            None => {
+                let new_pn = PageNumber::try_from(u32::try_from(
+                    self.file
+                        .metadata()?
+                        .len()
+                        .checked_div(self.page_size as u64)
+                        .ok_or_else(|| anyhow::anyhow!("can't divide file size by page size"))?
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("can't add 1 to filesize/pagesize"))?,
+                )?)?;
+                if new_pn.get() > MAX_PAGE_COUNT {
+                    anyhow::bail!(
+                        "sorry bro database size limit reached make a new database holy shit tf are you doing with 281 TB OF DATA????"
+                    )
+                }
+                self.write_page(new_pn, vec![0u8; self.page_size])?;
+                Ok(new_pn)
+            }
+        }
     }
 
-    /// Adds a page to the leaked list (for now).
-    pub fn free_page(&mut self, freed_pn: PageNumber) {
-        self.leaked.push(freed_pn);
-    }
+    /// Adds a page to the freelist.
+    pub fn free_page(&mut self, freed_pn: PageNumber) -> anyhow::Result<()> {
+        if freed_pn == 1
+            || freed_pn.get() > MAX_PAGE_COUNT
+            || (freed_pn.get() as u64) > (self.file.metadata()?.len() / self.page_size as u64)
+        {
+            anyhow::bail!("invalid page number")
+        }
+        self.file.sync_all()?;
 
-    /// Returns an immutable reference to the list of leaked pages.
-    pub fn leaked_pages(&self) -> &[PageNumber] {
-        &self.leaked
+        self.insert_fp(freed_pn)
     }
 }
 
@@ -255,6 +285,72 @@ mod tests {
         let first = pager.get_page(pn1).unwrap().to_vec();
         let second = pager.get_page(pn1).unwrap().to_vec();
         assert_eq!(first, second);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn free_page_rejects_page_one_huge_and_past_eof() {
+        let path = temp_db_path("free_validation");
+        let mut pager = Pager::new(&path, 512).unwrap();
+
+        assert!(pager.free_page(PageNumber::try_from(1).unwrap()).is_err());
+        // above MAX_PAGE_COUNT without needing a huge file
+        assert!(
+            pager
+                .free_page(PageNumber::try_from(u32::MAX).unwrap())
+                .is_err()
+        );
+        // past end of a 1-page file
+        assert!(pager.free_page(PageNumber::try_from(50).unwrap()).is_err());
+        // double free fails the second time
+        let p2 = pager.allocate_page().unwrap();
+        pager.free_page(p2).unwrap();
+        assert!(pager.free_page(p2).is_err());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn allocate_appends_zeroed_pages_when_freelist_empty() {
+        let path = temp_db_path("alloc_append");
+        let mut pager = Pager::new(&path, 512).unwrap();
+
+        let p2 = pager.allocate_page().unwrap();
+        assert_eq!(p2, PageNumber::try_from(2).unwrap());
+        let p3 = pager.allocate_page().unwrap();
+        assert_eq!(p3, PageNumber::try_from(3).unwrap());
+        assert_eq!(pager.get_page(p2).unwrap(), vec![0u8; 512]);
+        assert_eq!(pager.get_page(p3).unwrap(), vec![0u8; 512]);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 3 * 512);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn allocate_reuses_freed_pages_lifo_without_growing_file() {
+        let path = temp_db_path("alloc_reuse");
+        let mut pager = Pager::new(&path, 512).unwrap();
+        let p2 = pager.allocate_page().unwrap();
+        let p3 = pager.allocate_page().unwrap();
+        let p4 = pager.allocate_page().unwrap();
+        pager.free_page(p2).unwrap();
+        pager.free_page(p3).unwrap();
+        pager.free_page(p4).unwrap();
+
+        let size_before = std::fs::metadata(&path).unwrap().len();
+        // freelist head holds p4's trunk with [p2?..] — LIFO pops p4's leaves first.
+        // p2 became the trunk, p3/p4 are its leaves: pop order p4, p3, then trunk p2.
+        assert_eq!(pager.allocate_page().unwrap(), p4);
+        assert_eq!(pager.allocate_page().unwrap(), p3);
+        assert_eq!(pager.allocate_page().unwrap(), p2);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size_before);
+        // every reused page comes back zeroed
+        assert_eq!(pager.get_page(p2).unwrap(), vec![0u8; 512]);
+        // freelist is drained: next allocate grows the file again
+        let p5 = pager.allocate_page().unwrap();
+        assert_eq!(p5, PageNumber::try_from(5).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size_before + 512);
 
         std::fs::remove_file(&path).ok();
     }

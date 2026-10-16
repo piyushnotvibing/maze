@@ -256,22 +256,22 @@ sorted order with invariants holding.
 
 **Checklist**
 
-- [ ] Implement leaf delete: locate the cell by row id, remove its pointer,
+- [x] Implement leaf delete: locate the cell by row id, remove its pointer,
       compact the cell-pointer array (you can leave the "hole" in the cell
       content area unreclaimed for now — note that as a simplification that
       Subproject 7's freelist thinking doesn't need to solve at the page-
       internal level, only at the whole-page level).
-- [ ] Decide and document your rebalancing policy explicitly rather than
+- [x] Decide and document your rebalancing policy explicitly rather than
       implementing full SQLite-style borrow/merge on every underflow. A
       reasonable simplified policy: tolerate underfull leaves, and only
       merge two leaves when one becomes completely empty (reclaim that page
       via the pager's free-page mechanism from Subproject 7, or stub it as
       "leaked" until Subproject 7 lands — pick one and note it).
-- [ ] If a merge empties out a separator in the parent, remove that
+- [x] If a merge empties out a separator in the parent, remove that
       separator (and recursively handle parent underflow using the same
       simplified policy).
-- [ ] Reuse the Subproject 5 invariant checker after every delete in tests.
-- [ ] Test: insert N rows, delete a pseudo-random subset, assert the
+- [x] Reuse the Subproject 5 invariant checker after every delete in tests.
+- [x] Test: insert N rows, delete a pseudo-random subset, assert the
       remaining rows are exactly right and invariants hold; also test
       deleting a nonexistent row id is a clean no-op/error per your API
       design.
@@ -293,14 +293,14 @@ in `src/file/`.
 
 **Checklist**
 
-- [ ] Implement the freelist per `FILE.md`'s structure (trunk pages holding
+- [x] Implement the freelist per `FILE.md`'s structure (trunk pages holding
       pointers to leaf/free pages): `Pager::free_page(id)` pushes onto the
       freelist, `Pager::allocate_page()` pops from it first before
       appending at EOF.
-- [ ] Store the freelist head page number in the file header (you'll need
+- [x] Store the freelist head page number in the file header (you'll need
       to add that field — `FILE.md` has it commented out; design its
       offset/size and update both the doc and `header.rs`).
-- [ ] Wire Subproject 6's "leaked page on merge" into real
+- [x] Wire Subproject 6's "leaked page on merge" into real
       `Pager::free_page` calls.
 - [ ] Implement overflow pages: when a record's payload is too large for a
       cell on a given page, store the first N bytes inline followed by a

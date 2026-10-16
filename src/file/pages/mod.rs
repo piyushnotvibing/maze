@@ -4,6 +4,7 @@ pub mod interior;
 pub mod leaf;
 pub mod spec;
 pub mod table;
+pub mod trunk;
 pub mod types;
 
 mod bytes;

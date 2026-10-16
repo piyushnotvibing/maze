@@ -30,11 +30,12 @@
 
 | Offset | Size | Description |
 | :---:  | :---:| :---        |
-| 0 | 14 | Header string "Maze format 1\0" |
+| 0 | 14 | Header string "Maze format 2\0" |
 | 14 | 1 | Page size $\in$ [9, 16] |
-<!-- | 15 | 8 | Pointer to first Freelist block | -->
+| 15 | 4 | Page number of first freelist trunk page |
+<!-- | 19 | 4 | Number of free pages | -->
 
-Database header size = 15B (as of now)
+Database header size = 19B (as of now)
 
 ![alt text](theory/images/image.png)
 
@@ -51,3 +52,9 @@ Database header size = 15B (as of now)
 5. freed pages are leaked for now (next subproject reclaims them in the freelist)
 
 - repacking reclaims inter-page holes in disk, so that is already covered. 
+
+# Freelist policy
+1. a newly initialized database starts with freelist page set to 0 (no free page, 1st page is automatically a table leaf page)
+2. when a page is freed for the first time, it becomes the new head freelist trunk page.
+
+**Note**: freelist ops are not yet atomic. `get_fp` and `insert_fp` write a freelist trunk page, and then write to header. if in between a crash occurs, state will be inconsistent on the next init (head = none but count > 0, head = some but count == 0 etc).
