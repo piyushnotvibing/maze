@@ -1,6 +1,7 @@
 use crate::file::{
     pages::{
         PageType,
+        bytes::read_word_u32_be,
         cell::Cell,
         spec::PageSpec,
         table::{SplitKind, TablePage, best_split},
@@ -101,30 +102,53 @@ impl TablePage for TableLeafPage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableLeafCell {
     pub row_id: u64, // varint encoded on disk
-    pub payload: Vec<u8>,
+    pub local_payload: Vec<u8>,
+    pub total_payload_len: usize, // full logical length
+    pub overflow_pn: Option<PageNumber>,
 }
 
 impl TableLeafCell {
+    /// used when there's no overflow
     pub fn new(row_id: u64, payload: &[u8]) -> Self {
         Self {
             row_id,
-            payload: payload.to_vec(),
+            local_payload: payload.to_vec(),
+            total_payload_len: payload.len(),
+            overflow_pn: None,
+        }
+    }
+
+    pub fn with_overflow(
+        row_id: u64,
+        local_payload: Vec<u8>,
+        total_payload_len: usize,
+        overflow_pn: Option<PageNumber>,
+    ) -> Self {
+        Self {
+            row_id,
+            local_payload,
+            total_payload_len,
+            overflow_pn,
         }
     }
 }
 
 impl Cell for TableLeafCell {
     fn serialize(&self) -> Vec<u8> {
-        let mut bytes = varint::encode(self.payload.len() as u64);
+        let mut bytes = varint::encode(self.total_payload_len as u64);
         bytes.extend(varint::encode(self.row_id));
-        bytes.extend_from_slice(&self.payload);
+        bytes.extend_from_slice(&self.local_payload);
+        if let Some(n) = self.overflow_pn {
+            bytes.extend(n.get().to_be_bytes());
+        }
         bytes
     }
 
     fn encoded_len(&self) -> usize {
-        varint::encode(self.payload.len() as u64).len()
+        varint::encode(self.total_payload_len as u64).len()
             + varint::encode(self.row_id).len()
-            + self.payload.len()
+            + self.local_payload.len()
+            + if self.overflow_pn.is_some() { 4 } else { 0 } // overflow page number = u32 = 4B, only when present
     }
 
     fn sort_key(&self) -> u64 {
@@ -132,23 +156,42 @@ impl Cell for TableLeafCell {
     }
 
     /// ps to be used when overflow pages will be supported.
-    fn parse(buf: &[u8], _ps: PageSpec) -> anyhow::Result<Self> {
-        let (size, size_bytes_read) =
+    fn parse(buf: &[u8], ps: PageSpec) -> anyhow::Result<Self> {
+        let cap = ps.max_local_payload_len()?;
+        let (total_payload_len, len_bytes_read) =
             varint::decode(buf).ok_or(anyhow::anyhow!("invalid cell size varint"))?;
-        let (row_id, rowid_bytes_read) = varint::decode(&buf[size_bytes_read..])
+        let (row_id, rowid_bytes_read) = varint::decode(&buf[len_bytes_read..])
             .ok_or_else(|| anyhow::anyhow!("invalid row_id varint"))?;
 
-        let start = size_bytes_read + rowid_bytes_read;
-        let end = usize::try_from(size)
+        let local_len = total_payload_len.min(cap as u64);
+
+        let start = len_bytes_read + rowid_bytes_read;
+        let end = usize::try_from(local_len)
             .ok()
             .and_then(|s| start.checked_add(s))
             .ok_or_else(|| anyhow::anyhow!("payload size out of range"))?;
-        let payload = buf
+        let local_payload = buf
             .get(start..end)
             .ok_or_else(|| anyhow::anyhow!("payload extends past buffer"))?
             .to_vec();
 
-        Ok(Self { row_id, payload })
+        let overflow_pn = if local_len < total_payload_len {
+            Some(PageNumber::try_from(read_word_u32_be(
+                buf,
+                start + (local_len as usize),
+            )?)?)
+        } else {
+            None
+        };
+
+        let total_payload_len = total_payload_len as usize;
+
+        Ok(Self {
+            row_id,
+            local_payload,
+            total_payload_len,
+            overflow_pn,
+        })
     }
 }
 
@@ -173,16 +216,23 @@ mod tests {
     fn table_leaf_cell_roundtrip() {
         let cell = TableLeafCell {
             row_id: 300,
-            payload: b"abc".to_vec(),
+            local_payload: b"abc".to_vec(),
+            total_payload_len: 3,
+            overflow_pn: None,
         };
         let ps = PageSpec::fresh(512);
         let parsed = TableLeafCell::parse(cell.serialize().as_slice(), ps).unwrap();
-        assert_eq!((parsed.row_id, parsed.payload), (300, b"abc".to_vec()));
+        assert_eq!(
+            (parsed.row_id, parsed.local_payload),
+            (300, b"abc".to_vec())
+        );
     }
 
     #[test]
     fn payload_decodes_into_a_value_array_correctly() {
-        const PAGE_SIZE: usize = 512;
+        // big enough that row 300's ~212-byte encoded record stays under the local-payload
+        // cap (page_size / 4), so this hand-rolled, overflow-unaware page layout stays valid.
+        const PAGE_SIZE: usize = 1024;
         let base = MAZE_HEADER_SIZE; // page 1: leaf starts right after the file header
         let leaf_len = PAGE_SIZE - base;
 
@@ -246,7 +296,7 @@ mod tests {
             assert_eq!(leaf.cells.len(), rows.len());
             for (cell, (row_id, expected)) in leaf.cells.iter().zip(&rows) {
                 assert_eq!(cell.row_id, *row_id);
-                assert_eq!(&Record::decode(&cell.payload).unwrap(), expected);
+                assert_eq!(&Record::decode(&cell.local_payload).unwrap(), expected);
             }
         } else {
             panic!("invalid page type")
@@ -307,15 +357,21 @@ mod tests {
         // Sanity: pointer 1 really does decode as a valid row_id-2 cell.
         let inner = TableLeafCell::parse(&buf[b_ptr as usize..], ps).unwrap();
         assert_eq!(inner.row_id, 2);
-        assert_eq!(inner.payload, b_payload);
+        assert_eq!(inner.local_payload, b_payload);
 
         assert!(TableLeafPage::parse(buf.as_slice(), ps).is_err());
     }
 
     #[test]
-    fn split_with_a_big_cell_at_every_position_gives_halves_that_fit_or_errors() {
+    fn split_with_a_big_cell_at_every_position_always_succeeds_via_overflow() {
+        // Before overflow pages existed, big_id 29/31 (14 or 15 small cells forced onto the
+        // big cell's side) made every two-way split infeasible. Overflow caps the big cell's
+        // on-disk cost to the local cap (512 / 4 = 128 bytes) + a 4-byte pointer, which a binary
+        // split can always accommodate regardless of position, so every position now succeeds.
         let left_spec = PageSpec::new(512, PageNumber::try_from(1).unwrap());
         let right_spec = PageSpec::fresh(512);
+        let cap = left_spec.max_local_payload_len().unwrap();
+        assert_eq!(cap, right_spec.max_local_payload_len().unwrap());
 
         for big_id in (1u64..=61).step_by(2) {
             // odd ids: before, between and after the 30 small rows
@@ -324,28 +380,28 @@ mod tests {
                     .map(|i| TableLeafCell::new(i * 2, &[i as u8; 10]))
                     .collect(),
             );
-            let big = TableLeafCell::new(big_id, &[0xABu8; 300]);
+            let full_payload = vec![0xABu8; 300];
+            let big = TableLeafCell::with_overflow(
+                big_id,
+                full_payload[..cap].to_vec(),
+                full_payload.len(),
+                Some(PageNumber::try_from(999).unwrap()),
+            );
             let result = page.clone().split_with(big.clone(), left_spec, right_spec);
 
-            // 14 or 15 small cells before the big one: no two-way split can hold it
-            assert_eq!(
-                result.is_ok(),
-                !matches!(big_id, 29 | 31),
-                "big_id {big_id}"
-            );
+            let (left, right, divider) = result.unwrap_or_else(|e| {
+                panic!("big_id {big_id} should always find a two-way split now: {e}")
+            });
+            left.serialize(left_spec).unwrap(); // both halves must really fit
+            right.serialize(right_spec).unwrap();
+            assert_eq!(left.cells.last().unwrap().row_id, divider);
+            assert!(right.cells[0].row_id > divider);
 
-            if let Ok((left, right, divider)) = result {
-                left.serialize(left_spec).unwrap(); // both halves must really fit
-                right.serialize(right_spec).unwrap();
-                assert_eq!(left.cells.last().unwrap().row_id, divider);
-                assert!(right.cells[0].row_id > divider);
-
-                let mut want = page.cells.clone();
-                want.push(big);
-                want.sort_by_key(|c| c.row_id);
-                let got: Vec<_> = left.cells.iter().chain(&right.cells).cloned().collect();
-                assert_eq!(got, want); // nothing lost, nothing duplicated
-            }
+            let mut want = page.cells.clone();
+            want.push(big);
+            want.sort_by_key(|c| c.row_id);
+            let got: Vec<_> = left.cells.iter().chain(&right.cells).cloned().collect();
+            assert_eq!(got, want); // nothing lost, nothing duplicated
         }
     }
 }

@@ -18,11 +18,10 @@ impl Pager {
         if freed_pn == 1 {
             anyhow::bail!("first page of the database cannot be a freelist trunk page")
         }
-        if self.list_fp()?.contains(&freed_pn) {
-            anyhow::bail!("cannot free an already freed page")
-        }
-        // Validate the count bump before touching any page so a bail
-        // leaves both memory and disk untouched.
+        // Very slow duplicate free page check.
+        // if self.list_fp()?.contains(&freed_pn) {
+        //     anyhow::bail!("cannot free an already freed page")
+        // }
         let new_count = self.header.free_page_count.checked_add(1).ok_or_else(|| {
             anyhow::anyhow!("dawg there are enough free pages already why ARE YOU ADDING MORE???")
         })?;
@@ -67,8 +66,6 @@ impl Pager {
                         if free_pn == 1 {
                             anyhow::bail!("first page of the database cannot be a free page")
                         }
-                        // Validate the count drop before persisting anything so
-                        // a corrupt zero-count bails with state untouched.
                         let new_count =
                             self.header.free_page_count.checked_sub(1).ok_or_else(|| {
                                 anyhow::anyhow!("how tf are number of free pages going negative")

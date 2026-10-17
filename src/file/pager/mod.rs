@@ -1,4 +1,5 @@
 pub mod freelist;
+pub mod overflow;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -18,6 +19,7 @@ pub struct Pager {
 
     file: File,
     cache: HashMap<PageNumber, Vec<u8>>,
+    free_cache: HashSet<PageNumber>,
     dirty: HashSet<u32>,
 }
 
@@ -50,13 +52,18 @@ impl Pager {
             anyhow::bail!("first page of the database cannot be a freelist trunk page")
         }
 
-        Ok(Self {
+        let mut pager = Self {
             header: maze_header,
             file,
             page_size,
             cache: HashMap::new(),
+            free_cache: HashSet::new(),
             dirty: HashSet::new(),
-        })
+        };
+
+        pager.free_cache = pager.list_fp()?.into_iter().collect();
+
+        Ok(pager)
     }
 
     // for new database creation -> writes header bytes along with an empty table leaf page in page 1.
@@ -83,6 +90,7 @@ impl Pager {
             file,
             page_size,
             cache: HashMap::new(),
+            free_cache: HashSet::new(),
             dirty: HashSet::new(),
         })
     }
@@ -133,7 +141,10 @@ impl Pager {
     /// Else allocates a new page, initializes it to all zeros and returns its page number.
     pub fn allocate_page(&mut self) -> anyhow::Result<PageNumber> {
         match self.get_fp()? {
-            Some(free_pn) => Ok(free_pn),
+            Some(free_pn) => {
+                self.free_cache.remove(&free_pn);
+                Ok(free_pn)
+            }
             None => {
                 let new_pn = PageNumber::try_from(u32::try_from(
                     self.file
@@ -164,8 +175,12 @@ impl Pager {
             anyhow::bail!("invalid page number")
         }
         self.file.sync_all()?;
-
-        self.insert_fp(freed_pn)
+        if self.free_cache.contains(&freed_pn) {
+            anyhow::bail!("attempted double free: cannot free an already freed page")
+        }
+        self.insert_fp(freed_pn)?;
+        self.free_cache.insert(freed_pn);
+        Ok(())
     }
 }
 

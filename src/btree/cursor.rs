@@ -68,8 +68,14 @@ impl<'a> Cursor<'a> {
     ) -> anyhow::Result<Option<TableLeafCell>> {
         match self.fetch_page(page_number)? {
             Page::TableLeaf(lp) => {
-                let res = lp.cells.binary_search_by(|cell| cell.row_id.cmp(&row_id));
-                Ok(res.ok().map(|idx| lp.cells[idx].clone()))
+                match lp.cells.binary_search_by(|cell| cell.row_id.cmp(&row_id)) {
+                    Ok(idx) => {
+                        let mut leaf = lp.cells[idx].clone();
+                        leaf.local_payload = self.materialize(&leaf)?;
+                        Ok(Some(leaf))
+                    }
+                    Err(_) => Ok(None),
+                }
             }
             Page::TableInterior(ip) => {
                 let next = ip.child_of(row_id);
@@ -84,7 +90,17 @@ impl<'a> Cursor<'a> {
         scanned: &mut Vec<TableLeafCell>,
     ) -> anyhow::Result<()> {
         match self.fetch_page(page_number)? {
-            Page::TableLeaf(lp) => scanned.extend(lp.cells),
+            Page::TableLeaf(lp) => {
+                for mut cell in lp.cells.into_iter() {
+                    match cell.overflow_pn {
+                        None => scanned.push(cell),
+                        Some(_) => {
+                            cell.local_payload = self.materialize(&cell)?;
+                            scanned.push(cell);
+                        }
+                    }
+                }
+            }
             Page::TableInterior(ip) => {
                 for cell in ip.cells.iter() {
                     self.scan_from(cell.left_child, scanned)?;
@@ -106,9 +122,26 @@ impl<'a> Cursor<'a> {
                 if lp.contains(row_id) {
                     anyhow::bail!("row_id already exists")
                 }
-
-                let new_cell = TableLeafCell::new(row_id, payload);
-                self.insert_or_split(new_cell, lp, page_number)
+                let cap = self.pager.spec(page_number).max_local_payload_len()?;
+                let new_cell = if payload.len() <= cap {
+                    TableLeafCell::new(row_id, payload)
+                } else {
+                    let overflow_pn = self.pager.write_overflow(&payload[cap..])?;
+                    TableLeafCell::with_overflow(
+                        row_id,
+                        payload[..cap].to_vec(),
+                        payload.len(),
+                        overflow_pn,
+                    )
+                };
+                let overflow_pn = new_cell.overflow_pn;
+                match self.insert_or_split(new_cell, lp, page_number) {
+                    Ok(res) => Ok(res),
+                    Err(e) => {
+                        self.pager.free_overflow(overflow_pn)?;
+                        Err(e)
+                    }
+                }
             }
             Page::TableInterior(mut ip) => {
                 let next = ip.child_of(row_id);
@@ -184,7 +217,8 @@ impl<'a> Cursor<'a> {
     ) -> anyhow::Result<DeleteOutcome> {
         match self.fetch_page(page_number)? {
             Page::TableLeaf(mut lp) => {
-                lp.delete(row_id)?;
+                let deleted = lp.delete(row_id)?;
+                self.pager.free_overflow(deleted.overflow_pn)?;
                 if lp.cells().is_empty() && page_number != self.root_pn {
                     return Ok(DeleteOutcome::DeletedChild);
                 }
@@ -230,6 +264,16 @@ impl<'a> Cursor<'a> {
                 }
             }
         }
+    }
+
+    fn materialize(&mut self, cell: &TableLeafCell) -> anyhow::Result<Vec<u8>> {
+        if cell.overflow_pn.is_none() {
+            return Ok(cell.local_payload.clone());
+        }
+        let tail_len = cell.total_payload_len as usize - cell.local_payload.len();
+        let mut full = cell.local_payload.clone();
+        full.extend(self.pager.read_overflow(cell.overflow_pn, tail_len)?);
+        Ok(full)
     }
 }
 
@@ -294,7 +338,9 @@ mod tests {
                 .iter()
                 .map(|&row_id| TableLeafCell {
                     row_id,
-                    payload: row_id.to_be_bytes().to_vec(),
+                    local_payload: row_id.to_be_bytes().to_vec(),
+                    total_payload_len: 8,
+                    overflow_pn: None,
                 })
                 .collect(),
         }
@@ -500,7 +546,7 @@ mod tests {
         for elem in &data {
             let got = cursor.seek(*elem).unwrap().unwrap();
             assert_eq!(got.row_id, *elem);
-            assert_eq!(got.payload, elem.to_be_bytes()); // you currently only check row_id
+            assert_eq!(got.local_payload, elem.to_be_bytes()); // you currently only check row_id
         }
 
         let scanned: Vec<u64> = cursor
@@ -525,10 +571,20 @@ mod tests {
         let size = std::fs::metadata(&path).unwrap().len();
 
         assert!(cursor.insert(1, b"dup").is_err()); // duplicate key
-        assert!(cursor.insert(2, &vec![0u8; 600]).is_err()); // larger than a 512-byte page
-
         assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
         assert_eq!(cursor.scan().unwrap().len(), 1);
+
+        // a payload bigger than a 512-byte page now succeeds via overflow pages: the local cap
+        // is page_size / 4 = 128, so a 600-byte payload spills 472 bytes into exactly one
+        // overflow page (its capacity is page_size - 4 = 508).
+        let big = vec![0xABu8; 600];
+        cursor.insert(2, &big).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            size + PAGE_SIZE as u64
+        );
+        assert_eq!(cursor.seek(2).unwrap().unwrap().local_payload, big);
+
         std::fs::remove_file(&path).ok();
     }
 
@@ -564,19 +620,23 @@ mod tests {
                 .seek(*id)
                 .unwrap()
                 .unwrap_or_else(|| panic!("row {id} is missing after the split"));
-            assert_eq!(&cell.payload, payload, "payload mismatch for row {id}");
+            assert_eq!(
+                &cell.local_payload, payload,
+                "payload mismatch for row {id}"
+            );
         }
         // and a scan returns all of them, in order
         let scanned: Vec<(u64, Vec<u8>)> = cursor
             .scan()
             .unwrap()
             .into_iter()
-            .map(|c| (c.row_id, c.payload))
+            .map(|c| (c.row_id, c.local_payload))
             .collect();
         assert_eq!(scanned, expected);
 
         // the split really happened: page 1 is now an interior root, and the file grew by exactly
-        // two pages (the new right half, plus the copy of the old root made by the root split)
+        // three pages (the new right half, the copy of the old root made by the root split, and
+        // one overflow page for the 300-byte cell's tail beyond the 128-byte local cap)
         let root_bytes = pager.get_page(pn(1)).unwrap().to_vec();
         assert!(matches!(
             Page::parse(&root_bytes, PageSpec::new(PAGE_SIZE as usize, pn(1))).unwrap(),
@@ -584,7 +644,7 @@ mod tests {
         ));
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
-            3 * PAGE_SIZE as u64
+            4 * PAGE_SIZE as u64
         );
 
         std::fs::remove_file(&path).ok();
@@ -603,8 +663,11 @@ mod tests {
     }
 
     #[test]
-    fn big_cell_in_the_middle_of_a_full_leaf_is_rejected_cleanly() {
-        // Needs a three-way split, which isn't supported: expect an error, no leak, no change.
+    fn big_cell_in_the_middle_of_a_full_leaf_now_succeeds_via_overflow() {
+        // Before overflow pages existed, a 300-byte cell landing with 15 small cells on each
+        // side needed a three-way split and was rejected. Overflow caps the cell's on-disk cost
+        // to the local cap (128 bytes) + a 4-byte pointer, which a binary split can always
+        // accommodate, so this now succeeds instead of erroring.
         let path = temp_db_path("big_cell_middle");
         let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
         let mut cursor = Cursor::new(&mut pager, pn(1));
@@ -612,10 +675,11 @@ mod tests {
             cursor.insert(i * 2, &[i as u8; 10]).unwrap();
         }
 
-        assert!(cursor.insert(31, &[0xABu8; 300]).is_err());
+        let big = vec![0xABu8; 300];
+        cursor.insert(31, &big).unwrap();
 
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), PAGE_SIZE as u64);
-        assert_eq!(cursor.scan().unwrap().len(), 30);
+        assert_eq!(cursor.seek(31).unwrap().unwrap().local_payload, big);
+        assert_eq!(cursor.scan().unwrap().len(), 31);
         std::fs::remove_file(&path).ok();
     }
 
@@ -1042,6 +1106,78 @@ mod tests {
         expected.extend_from_slice(&inserted);
         assert_eq!(scanned, expected);
         check_tree(&mut pager, pn(1)).unwrap();
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn seek_and_scan_resolve_mixed_local_and_overflowing_payloads() {
+        let path = temp_db_path("mixed_overflow");
+        let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
+        let mut cursor = Cursor::new(&mut pager, pn(1));
+
+        // local cap for a 512-byte page is 128 bytes.
+        let rows: Vec<(u64, Vec<u8>)> = vec![
+            (1, vec![0x11u8; 10]),                 // well under the cap
+            (2, vec![0x22u8; 128]),                // exactly at the cap: no overflow
+            (3, vec![0x33u8; 129]),                // one byte over: needs one overflow page
+            (4, vec![0x44u8; 508 + 508 + 37]),      // spans several overflow pages
+        ];
+        for (id, payload) in &rows {
+            cursor.insert(*id, payload).unwrap();
+        }
+
+        for (id, payload) in &rows {
+            let got = cursor
+                .seek(*id)
+                .unwrap()
+                .unwrap_or_else(|| panic!("row {id} missing"));
+            assert_eq!(&got.local_payload, payload, "seek mismatch for row {id}");
+        }
+
+        let scanned: Vec<(u64, Vec<u8>)> = cursor
+            .scan()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.row_id, c.local_payload))
+            .collect();
+        assert_eq!(scanned, rows);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_frees_the_overflowing_row_s_overflow_chain() {
+        let path = temp_db_path("delete_frees_overflow");
+        let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
+
+        // 300-byte payload: local cap is 128, so this spills into exactly one overflow page
+        // (the tail is 172 bytes, under the 508-byte-per-page overflow capacity).
+        {
+            let mut cursor = Cursor::new(&mut pager, pn(1));
+            cursor.insert(1, &vec![0xABu8; 300]).unwrap();
+        }
+        assert_eq!(pager.count_fp().unwrap(), 0);
+        let size_with_overflow = std::fs::metadata(&path).unwrap().len();
+
+        {
+            let mut cursor = Cursor::new(&mut pager, pn(1));
+            cursor.delete(1).unwrap();
+        }
+
+        // the overflow page is back on the freelist, not leaked.
+        assert_eq!(pager.count_fp().unwrap(), 1);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            size_with_overflow,
+            "freeing must not shrink or grow the file, just mark the page free"
+        );
+
+        // and it's genuinely reusable afterwards.
+        let size_before_reuse = std::fs::metadata(&path).unwrap().len();
+        pager.allocate_page().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size_before_reuse);
+        assert_eq!(pager.count_fp().unwrap(), 0);
 
         std::fs::remove_file(&path).ok();
     }

@@ -23,9 +23,9 @@ B+trees, indexing, query execution, and transactions.
 - [x] Subproject 2 — Record format (the "row" encoding)
 - [x] Subproject 3 — B-tree read path (interior pages + traversal)
 - [x] Subproject 4 — Pager / buffer pool
-- [ ] Subproject 5 — B-tree write path: insert & split
-- [ ] Subproject 6 — Delete & rebalancing (simplified)
-- [ ] Subproject 7 — Freelist & overflow pages
+- [x] Subproject 5 — B-tree write path: insert & split
+- [x] Subproject 6 — Delete & rebalancing (simplified)
+- [x] Subproject 7 — Freelist & overflow pages
 - [ ] Subproject 8 — Secondary indexes (index B-trees / B+tree style)
 - [ ] Subproject 9 — Catalog & schema
 - [ ] Subproject 10 — SQL tokenizer & parser
@@ -302,14 +302,14 @@ in `src/file/`.
       offset/size and update both the doc and `header.rs`).
 - [x] Wire Subproject 6's "leaked page on merge" into real
       `Pager::free_page` calls.
-- [ ] Implement overflow pages: when a record's payload is too large for a
+- [x] Implement overflow pages: when a record's payload is too large for a
       cell on a given page, store the first N bytes inline followed by a
       pointer to an overflow page (which itself may chain to further
       overflow pages for very large payloads). Implement both the write
       side (splitting a large payload across a chain) and the read side
       (`Record`/cell decoding transparently follows the chain to
       reassemble the full payload).
-- [ ] Test: insert a blob/text value large enough to require 2+ overflow
+- [x] Test: insert a blob/text value large enough to require 2+ overflow
       pages, read it back and verify byte-for-byte equality; delete enough
       rows to exercise freelist reuse and assert a subsequent insert reuses
       a freed page number rather than growing the file.

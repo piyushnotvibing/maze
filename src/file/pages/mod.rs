@@ -6,6 +6,7 @@ pub mod spec;
 pub mod table;
 pub mod trunk;
 pub mod types;
+pub mod overflow;
 
 mod bytes;
 
@@ -197,7 +198,9 @@ mod tests {
 
     #[test]
     fn page_parses_correctly() {
-        const PAGE_SIZE: usize = 512;
+        // big enough that the 200-byte payload stays under the local-payload cap
+        // (page_size / 4), so this hand-rolled, overflow-unaware page layout stays valid.
+        const PAGE_SIZE: usize = 2048;
         // Page 1: the leaf page starts right after the file header, and (as in your
         // original test) pointers and the content offset are relative to that start.
         let base = MAZE_HEADER_SIZE;
@@ -235,9 +238,9 @@ mod tests {
         if let Page::TableLeaf(leaf) = page {
             assert_eq!(leaf.cells.len(), rows.len());
             for (cell, (id, payload)) in leaf.cells.iter().zip(&rows) {
-                assert_eq!(cell.payload.len(), payload.len());
+                assert_eq!(cell.local_payload.len(), payload.len());
                 assert_eq!(cell.row_id, *id);
-                assert_eq!(&cell.payload, payload);
+                assert_eq!(&cell.local_payload, payload);
             }
         } else {
             panic!("invalid page type")
@@ -259,11 +262,15 @@ mod tests {
             cells: vec![
                 TableLeafCell {
                     row_id: 1,
-                    payload: b"abc".to_vec(),
+                    local_payload: b"abc".to_vec(),
+                    total_payload_len: 3,
+                    overflow_pn: None,
                 },
                 TableLeafCell {
                     row_id: 300,
-                    payload: vec![7u8; 50],
+                    local_payload: vec![7u8; 50],
+                    total_payload_len: 50,
+                    overflow_pn: None,
                 },
             ],
         };
