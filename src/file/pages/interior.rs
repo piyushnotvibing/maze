@@ -66,6 +66,7 @@ impl TableInteriorPage {
 
 impl TablePage for TableInteriorPage {
     type C = TableInteriorCell;
+    type Key = <Self::C as Cell>::Key;
     const PAGE_TYPE: PageType = PageType::TableInterior;
 
     fn from_parts(
@@ -137,6 +138,8 @@ impl TableInteriorCell {
 }
 
 impl Cell for TableInteriorCell {
+    type Key = u64;
+
     fn serialize(&self) -> Vec<u8> {
         let mut bytes = self.left_child.get().to_be_bytes().to_vec();
         bytes.extend_from_slice(&varint::encode(self.row_id));

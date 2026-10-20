@@ -40,6 +40,7 @@ impl TableLeafPage {
 
 impl TablePage for TableLeafPage {
     type C = TableLeafCell;
+    type Key = <Self::C as Cell>::Key;
 
     const PAGE_TYPE: PageType = PageType::TableLeaf;
 
@@ -134,6 +135,8 @@ impl TableLeafCell {
 }
 
 impl Cell for TableLeafCell {
+    type Key = u64;
+
     fn serialize(&self) -> Vec<u8> {
         let mut bytes = varint::encode(self.total_payload_len as u64);
         bytes.extend(varint::encode(self.row_id));

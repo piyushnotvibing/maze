@@ -116,7 +116,7 @@ impl<'a> Cursor<'a> {
         page_number: PageNumber,
         row_id: u64,
         payload: &[u8],
-    ) -> anyhow::Result<InsertOutcome> {
+    ) -> anyhow::Result<InsertOutcome<u64>> {
         match self.fetch_page(page_number)? {
             Page::TableLeaf(lp) => {
                 if lp.contains(row_id) {
@@ -166,7 +166,7 @@ impl<'a> Cursor<'a> {
         new_cell: P::C,
         mut page: P,
         page_number: PageNumber,
-    ) -> anyhow::Result<InsertOutcome> {
+    ) -> anyhow::Result<InsertOutcome<P::Key>> {
         let spec = self.pager.spec(page_number);
 
         if page.fits(&new_cell, self.pager.spec(page_number))? {
@@ -294,12 +294,12 @@ fn repoint_child(
     Ok(())
 }
 
-enum InsertOutcome {
+enum InsertOutcome<Key> {
     Done,
     Split {
         old_child: PageNumber,
         new_child: PageNumber,
-        divider: u64,
+        divider: Key,
     },
 }
 

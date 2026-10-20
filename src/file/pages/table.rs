@@ -8,6 +8,7 @@ use crate::file::pages::{
 
 pub(crate) trait TablePage: Sized {
     type C: Cell;
+    type Key: Ord;
     const PAGE_TYPE: PageType;
 
     fn from_parts(cells: Vec<Self::C>, rightmost_child: Option<PageNumber>)
@@ -23,7 +24,7 @@ pub(crate) trait TablePage: Sized {
         new_cell: Self::C,
         left: PageSpec,
         right: PageSpec,
-    ) -> anyhow::Result<(Self, Self, u64)>;
+    ) -> anyhow::Result<(Self, Self, Self::Key)>;
 
     fn cell_costs(&self) -> Vec<usize> {
         self.cells()

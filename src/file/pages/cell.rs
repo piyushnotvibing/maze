@@ -1,9 +1,13 @@
+use std::fmt::Display;
+
 use crate::file::pages::{PageType, bytes::read_word_u16_be, header::PageHeader, spec::PageSpec};
 
 pub trait Cell: Sized {
+    type Key: Ord + Display + Copy + Clone;
+
     fn serialize(&self) -> Vec<u8>;
     fn encoded_len(&self) -> usize;
-    fn sort_key(&self) -> u64;
+    fn sort_key(&self) -> Self::Key;
     fn parse(buf: &[u8], ps: PageSpec) -> anyhow::Result<Self>;
 }
 
@@ -27,7 +31,7 @@ pub(crate) fn parse_cells<C: Cell>(
         .ok_or_else(|| anyhow::anyhow!("page smaller than page header"))?;
     let cell_ptrs = parse_cell_ptrs(content_buffer, header.cell_count as usize)?;
 
-    let mut prev_row_id: Option<u64> = None;
+    let mut prev_row_id: Option<C::Key> = None;
     let mut spans: Vec<(usize, usize)> = Vec::with_capacity(cell_ptrs.len());
     let cells = cell_ptrs
         .iter()
@@ -53,8 +57,8 @@ pub(crate) fn parse_cells<C: Cell>(
             }
             spans.push((ptr, end));
 
-            if let Some(prev) = prev_row_id
-                && res.sort_key() <= prev
+            if let Some(prev) = prev_row_id.clone()
+                && res.sort_key() <= (prev as <C as Cell>::Key)
             {
                 anyhow::bail!("cell pointers not sorted by row_id")
             }
