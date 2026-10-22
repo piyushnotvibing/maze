@@ -1,14 +1,23 @@
-use std::fmt::Display;
+use std::fmt::Debug;
 
-use crate::file::pages::{PageType, bytes::read_word_u16_be, header::PageHeader, spec::PageSpec};
+use crate::storage::pages::{
+    PageType, bytes::read_word_u16_be, header::PageHeader, spec::PageSpec, types::PageNumber,
+};
 
 pub trait Cell: Sized {
-    type Key: Ord + Display + Copy + Clone;
+    type Key: Ord + Clone + Debug;
 
-    fn serialize(&self) -> Vec<u8>;
-    fn encoded_len(&self) -> usize;
+    // only index cells require that the below two function return results.
+    fn serialize(&self) -> anyhow::Result<Vec<u8>>;
+    fn encoded_len(&self) -> anyhow::Result<usize>;
     fn sort_key(&self) -> Self::Key;
     fn parse(buf: &[u8], ps: PageSpec) -> anyhow::Result<Self>;
+}
+
+/// Implemented by the interior cell of each b-tree family (table, index).
+/// Separate from `Cell` because leaf cells have no child pointer to expose.
+pub trait InteriorCell: Cell {
+    fn left_child(&self) -> PageNumber;
 }
 
 pub(crate) fn parse_cells<C: Cell>(
@@ -31,7 +40,7 @@ pub(crate) fn parse_cells<C: Cell>(
         .ok_or_else(|| anyhow::anyhow!("page smaller than page header"))?;
     let cell_ptrs = parse_cell_ptrs(content_buffer, header.cell_count as usize)?;
 
-    let mut prev_row_id: Option<C::Key> = None;
+    let mut prev_key: Option<C::Key> = None;
     let mut spans: Vec<(usize, usize)> = Vec::with_capacity(cell_ptrs.len());
     let cells = cell_ptrs
         .iter()
@@ -50,19 +59,19 @@ pub(crate) fn parse_cells<C: Cell>(
                 ps,
             )?;
             let end = ptr
-                .checked_add(res.encoded_len())
+                .checked_add(res.encoded_len()?)
                 .ok_or_else(|| anyhow::anyhow!("cell end overflows"))?;
             if end > buf.len() {
                 anyhow::bail!("cell extends past end of page");
             }
             spans.push((ptr, end));
 
-            if let Some(prev) = prev_row_id.clone()
+            if let Some(prev) = prev_key.clone()
                 && res.sort_key() <= (prev as <C as Cell>::Key)
             {
                 anyhow::bail!("cell pointers not sorted by row_id")
             }
-            prev_row_id = Some(res.sort_key());
+            prev_key = Some(res.sort_key());
 
             Ok(res)
         })

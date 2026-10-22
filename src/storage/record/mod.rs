@@ -1,95 +1,9 @@
-use crate::file::varint;
+pub mod values;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    Null,
-    Int(i64),
-    Float(f64),
-    Blob(Vec<u8>),
-    Text(String),
-}
-
-impl Value {
-    pub fn encode(&self) -> Vec<u8> {
-        match self {
-            Value::Null => Vec::new(),
-            Value::Int(i) => i.to_be_bytes().to_vec(),
-            Value::Float(f) => f.to_be_bytes().to_vec(),
-            Value::Blob(b) => b.clone(),
-            Value::Text(t) => t.as_bytes().to_vec(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum DataType {
-    Null,
-    Int,
-    Float,
-    Blob(u64),
-    Text(u64),
-}
-
-impl From<&Value> for DataType {
-    fn from(value: &Value) -> Self {
-        match value {
-            Value::Null => DataType::Null,
-            Value::Int(_) => DataType::Int,
-            Value::Float(_) => DataType::Float,
-            Value::Blob(b) => DataType::Blob(b.len() as u64),
-            Value::Text(t) => DataType::Text(t.len() as u64),
-        }
-    }
-}
-
-/*
-    ----------------------------------------------------------------
-    | Tag                     ->        Value                      |
-    | ------------------------------------------------------------ |
-    | 0                       ->        Null                       |
-    | 6                       ->        Signed 64 bit int          |
-    | 7                       ->        64 bit float               |
-    | >= 12 && tag % 2 == 0   ->        BLOB                       |
-    | >= 13 && tag % 2 == 1   ->        Text                       |
-    ----------------------------------------------------------------
-*/
-impl DataType {
-    fn new(code: u64) -> anyhow::Result<Self> {
-        match code {
-            0 => Ok(DataType::Null),
-            6 => Ok(DataType::Int),
-            7 => Ok(DataType::Float),
-            _ => {
-                let code_is_even = code.is_multiple_of(2);
-                if code >= 12 && code_is_even {
-                    Ok(DataType::Blob((code - 12) / 2))
-                } else if code >= 13 && !code_is_even {
-                    Ok(DataType::Text((code - 13) / 2))
-                } else {
-                    anyhow::bail!("invalid code, no corresponding data type")
-                }
-            }
-        }
-    }
-
-    fn code(&self) -> anyhow::Result<u64> {
-        match self {
-            DataType::Null => Ok(0),
-            DataType::Int => Ok(6),
-            DataType::Float => Ok(7),
-            DataType::Blob(blob_len) => 2u64
-                .checked_mul(*blob_len)
-                .ok_or_else(|| anyhow::anyhow!("blob size too big for u64"))?
-                .checked_add(12)
-                .ok_or_else(|| anyhow::anyhow!("blob size too big for u64")),
-            DataType::Text(text_len) => 2u64
-                .checked_mul(*text_len)
-                .ok_or_else(|| anyhow::anyhow!("text size too big for u64"))?
-                .checked_add(13)
-                .ok_or_else(|| anyhow::anyhow!("text size too big for u64")),
-        }
-    }
-}
+use crate::storage::{
+    record::values::{DataType, Value},
+    varint,
+};
 
 #[derive(Debug, Clone)]
 pub struct RecordHeader {
@@ -98,7 +12,7 @@ pub struct RecordHeader {
 }
 
 impl RecordHeader {
-    fn build(mut buf: &[u8]) -> anyhow::Result<(Self, usize)> {
+    fn parse(mut buf: &[u8]) -> anyhow::Result<(Self, usize)> {
         let (header_len, bytes_read) =
             varint::decode(buf).ok_or_else(|| anyhow::anyhow!("invalid header length varint"))?;
         let header_len = usize::try_from(header_len)?;
@@ -163,8 +77,8 @@ impl Record {
         })
     }
 
-    pub fn build(mut buf: &[u8]) -> anyhow::Result<Self> {
-        let (header, header_len) = RecordHeader::build(buf)?;
+    pub fn parse(mut buf: &[u8]) -> anyhow::Result<(Self, usize)> {
+        let (header, header_len) = RecordHeader::parse(buf)?;
         buf = buf
             .get(header_len..)
             .ok_or_else(|| anyhow::anyhow!("record's header is smaller than the record wow"))?;
@@ -190,11 +104,11 @@ impl Record {
             }
         }
 
-        if offset != buf.len() {
-            anyhow::bail!("corrupted buffer")
-        }
+        let bytes_read = header_len
+            .checked_add(offset)
+            .ok_or_else(|| anyhow::anyhow!("wtf how did you read so many bytes damn"))?;
 
-        Ok(Record { header, body })
+        Ok((Record { header, body }, bytes_read))
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -206,9 +120,9 @@ impl Record {
         bytes
     }
 
-    pub fn decode(buf: &[u8]) -> anyhow::Result<Vec<Value>> {
-        let record = Record::build(buf)?;
-        Ok(record.body)
+    pub fn decode(buf: &[u8]) -> anyhow::Result<(Vec<Value>, usize)> {
+        let (record, bytes_read) = Record::parse(buf)?;
+        Ok((record.body, bytes_read))
     }
 }
 
@@ -238,13 +152,13 @@ mod tests {
             Value::Text("x".into()),
         ];
         let rec = Record::new(values.clone()).unwrap();
-        assert_eq!(Record::decode(&rec.encode()).unwrap(), values);
+        assert_eq!(Record::decode(&rec.encode()).unwrap(), (values, 31));
     }
 
     #[test]
     fn record_with_130_nulls_to_test_header_len_logic() {
         let values = vec![Value::Null; 130];
         let rec = Record::new(values.clone()).unwrap();
-        assert_eq!(Record::decode(&rec.encode()).unwrap(), values);
+        assert_eq!(Record::decode(&rec.encode()).unwrap(), (values, 132));
     }
 }

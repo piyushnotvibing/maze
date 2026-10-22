@@ -8,9 +8,9 @@ use std::{
     path::Path,
 };
 
-use crate::file::{
+use crate::storage::{
     header::{MAX_PAGE_COUNT, MAZE_HEADER_SIZE, MazeHeader},
-    pages::{PageType, leaf::TableLeafCell, spec::PageSpec, types::PageNumber},
+    pages::{PageType, table::leaf::TableLeafCell, spec::PageSpec, types::PageNumber},
 };
 
 pub struct Pager {
@@ -231,7 +231,7 @@ fn open_rw(path: &str, create: bool) -> std::io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::pages::Page;
+    use crate::storage::pages::Page;
 
     fn temp_db_path(tag: &str) -> String {
         let mut path = std::env::temp_dir();
@@ -253,7 +253,7 @@ mod tests {
         let bytes = pager.get_page(pn1).unwrap().to_vec();
         match Page::parse(&bytes, ps).unwrap() {
             Page::TableLeaf(lp) => assert!(lp.cells.is_empty()),
-            Page::TableInterior(_) => panic!("expected an empty leaf page as the fresh root"),
+            _ => panic!("expected an empty leaf page as the fresh root"),
         }
 
         std::fs::remove_file(&path).ok();
@@ -274,7 +274,7 @@ mod tests {
         let bytes = reopened.get_page(pn1).unwrap().to_vec();
         match Page::parse(&bytes, ps).unwrap() {
             Page::TableLeaf(lp) => assert!(lp.cells.is_empty()),
-            Page::TableInterior(_) => panic!("expected a leaf page"),
+            _ => panic!("expected a leaf page"),
         }
 
         std::fs::remove_file(&path).ok();

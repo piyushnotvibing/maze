@@ -1,4 +1,4 @@
-use crate::file::{header::MAZE_HEADER_SIZE, pages::types::PageNumber};
+use crate::storage::{header::MAZE_HEADER_SIZE, pages::types::PageNumber};
 
 const LOCAL_PAYLOAD_THRESHOLD_RATIO: usize = 4;
 
@@ -12,6 +12,7 @@ impl PageSpec {
     pub fn new(page_size: usize, pn: PageNumber) -> Self {
         Self {
             page_size,
+            // first = true if pn is the first page of the database.
             first: pn == 1,
         }
     }

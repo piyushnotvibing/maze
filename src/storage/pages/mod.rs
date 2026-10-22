@@ -1,17 +1,21 @@
+pub mod btree_page;
 pub mod cell;
 pub mod header;
-pub mod interior;
-pub mod leaf;
+pub mod index;
+pub mod overflow;
 pub mod spec;
 pub mod table;
 pub mod trunk;
 pub mod types;
-pub mod overflow;
 
 mod bytes;
 
-use crate::file::pages::{
-    cell::Cell, interior::TableInteriorPage, leaf::TableLeafPage, spec::PageSpec, table::TablePage,
+use crate::storage::pages::{
+    btree_page::BTreePage,
+    cell::Cell,
+    index::{interior::IndexInteriorPage, leaf::IndexLeafPage},
+    spec::PageSpec,
+    table::{interior::TableInteriorPage, leaf::TableLeafPage},
     types::PageNumber,
 };
 
@@ -22,6 +26,8 @@ pub const CELL_PTR_SIZE: usize = 2;
 pub enum Page {
     TableLeaf(TableLeafPage),
     TableInterior(TableInteriorPage),
+    IndexLeaf(IndexLeafPage),
+    IndexInterior(IndexInteriorPage),
 }
 
 impl Page {
@@ -41,13 +47,37 @@ impl Page {
         match page_type {
             PageType::TableLeaf => Ok(Page::TableLeaf(TableLeafPage::parse(buf, ps)?)),
             PageType::TableInterior => Ok(Page::TableInterior(TableInteriorPage::parse(buf, ps)?)),
+            PageType::IndexLeaf => {
+                if ps.first {
+                    anyhow::bail!("first page of database cannot be an index leaf page")
+                }
+                Ok(Page::IndexLeaf(IndexLeafPage::parse(buf, ps)?))
+            }
+            PageType::IndexInterior => {
+                if ps.first {
+                    anyhow::bail!("first page of database cannot be an index interior page")
+                }
+                Ok(Page::IndexInterior(IndexInteriorPage::parse(buf, ps)?))
+            }
         }
     }
 
     pub fn serialize(&self, ps: PageSpec) -> anyhow::Result<Vec<u8>> {
         match self {
-            Page::TableLeaf(lp) => lp.serialize(ps),
-            Page::TableInterior(ip) => ip.serialize(ps),
+            Page::TableLeaf(tlp) => tlp.serialize(ps),
+            Page::TableInterior(tip) => tip.serialize(ps),
+            Page::IndexLeaf(ilp) => {
+                if ps.first {
+                    anyhow::bail!("first page of database cannot be an index leaf page")
+                }
+                ilp.serialize(ps)
+            }
+            Page::IndexInterior(iip) => {
+                if ps.first {
+                    anyhow::bail!("first page of database cannot be an index interior page")
+                }
+                iip.serialize(ps)
+            }
         }
     }
 }
@@ -56,6 +86,8 @@ impl Page {
 pub(crate) enum PageType {
     TableLeaf,
     TableInterior,
+    IndexLeaf,
+    IndexInterior,
 }
 
 impl PageType {
@@ -68,7 +100,7 @@ impl PageType {
         let cells_bytes = cells
             .iter()
             .map(|c| c.serialize())
-            .collect::<Vec<Vec<u8>>>();
+            .collect::<anyhow::Result<Vec<Vec<u8>>>>()?;
 
         self.pack(&cells_bytes, rightmost_child, ps)
     }
@@ -149,8 +181,8 @@ impl PageType {
 
     pub fn header_size(&self) -> usize {
         match self {
-            PageType::TableLeaf => 5,
-            PageType::TableInterior => 9,
+            PageType::TableLeaf | PageType::IndexLeaf => 5,
+            PageType::TableInterior | PageType::IndexInterior => 9,
         }
     }
 }
@@ -160,6 +192,8 @@ impl From<PageType> for u8 {
         match value {
             PageType::TableLeaf => 13,
             PageType::TableInterior => 5,
+            PageType::IndexLeaf => 10,
+            PageType::IndexInterior => 2,
         }
     }
 }
@@ -171,6 +205,8 @@ impl TryFrom<u8> for PageType {
         match value {
             13 => Ok(PageType::TableLeaf),
             5 => Ok(PageType::TableInterior),
+            10 => Ok(PageType::IndexLeaf),
+            2 => Ok(PageType::IndexInterior),
             _ => anyhow::bail!("invalid page type"),
         }
     }
@@ -179,19 +215,22 @@ impl TryFrom<u8> for PageType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{
+    use crate::storage::{
         header::MAZE_HEADER_SIZE,
         pages::{
-            interior::{TableInteriorCell, TableInteriorPage},
-            leaf::TableLeafCell,
+            table::{
+                interior::{TableInteriorCell, TableInteriorPage},
+                leaf::TableLeafCell,
+            },
+            types::RowID,
         },
         varint,
     };
 
     // Build one cell: varint(payload len) | varint(row_id) | payload
-    fn cell_bytes(row_id: u64, payload: &[u8]) -> Vec<u8> {
+    fn cell_bytes(row_id: RowID, payload: &[u8]) -> Vec<u8> {
         let mut c = varint::encode(payload.len() as u64);
-        c.extend(varint::encode(row_id));
+        c.extend(varint::encode(row_id.get()));
         c.extend_from_slice(payload);
         c
     }
@@ -209,7 +248,10 @@ mod tests {
         // Mix of 1-byte and multi-byte varints: len 3 / id 1, and len 200 / id 300
         // (200 and 300 both need 2 bytes each).
         let rows: Vec<(u64, Vec<u8>)> = vec![(1, b"abc".to_vec()), (300, vec![7u8; 200])];
-        let cells: Vec<Vec<u8>> = rows.iter().map(|(id, p)| cell_bytes(*id, p)).collect();
+        let cells: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|(id, p)| cell_bytes(RowID::try_from(*id).unwrap(), p))
+            .collect();
 
         // Pack cells contiguously at the end of the leaf; offsets come from real lengths.
         let total: usize = cells.iter().map(Vec::len).sum();
@@ -261,13 +303,13 @@ mod tests {
         let original = TableLeafPage {
             cells: vec![
                 TableLeafCell {
-                    row_id: 1,
+                    row_id: RowID::try_from(1).unwrap(),
                     local_payload: b"abc".to_vec(),
                     total_payload_len: 3,
                     overflow_pn: None,
                 },
                 TableLeafCell {
-                    row_id: 300,
+                    row_id: RowID::try_from(300).unwrap(),
                     local_payload: vec![7u8; 50],
                     total_payload_len: 50,
                     overflow_pn: None,
@@ -286,7 +328,7 @@ mod tests {
 
         match Page::parse(&bytes, ps).unwrap() {
             Page::TableLeaf(parsed) => assert_eq!(parsed, original),
-            Page::TableInterior(_) => panic!("expected a leaf page back"),
+            _ => panic!("expected a leaf page back"),
         }
     }
 
@@ -299,7 +341,7 @@ mod tests {
         let original = TableInteriorPage {
             cells: vec![TableInteriorCell {
                 left_child: PageNumber::try_from(5).unwrap(),
-                row_id: 100,
+                row_id: RowID::try_from(100).unwrap(),
             }],
             rightmost_child: PageNumber::try_from(6).unwrap(),
         };
@@ -313,7 +355,7 @@ mod tests {
 
         match Page::parse(&bytes, ps).unwrap() {
             Page::TableInterior(parsed) => assert_eq!(parsed, original),
-            Page::TableLeaf(_) => panic!("expected an interior page back"),
+            _ => panic!("expected an interior page back"),
         }
     }
 }

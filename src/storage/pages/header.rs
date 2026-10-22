@@ -1,4 +1,4 @@
-use crate::file::pages::{
+use crate::storage::pages::{
     PageType,
     bytes::{read_word_u16_be, read_word_u32_be},
     types::PageNumber,
@@ -39,7 +39,12 @@ impl PageHeader {
                 buf,
                 PAGE_RIGHTMOST_CHILD_OFFSET,
             )?)?),
+            PageType::IndexInterior => Some(PageNumber::try_from(read_word_u32_be(
+                buf,
+                PAGE_RIGHTMOST_CHILD_OFFSET,
+            )?)?),
             PageType::TableLeaf => None,
+            PageType::IndexLeaf => None,
         };
 
         Ok(Self {

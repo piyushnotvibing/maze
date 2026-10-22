@@ -1,4 +1,4 @@
-use crate::file::pages::types::PageNumber;
+use crate::storage::pages::types::PageNumber;
 
 pub const MAZE_HEADER_SIZE: usize = 23;
 pub const MAX_PAGE_COUNT: u32 = u32::MAX - 1;

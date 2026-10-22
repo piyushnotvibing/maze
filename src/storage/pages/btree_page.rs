@@ -1,4 +1,4 @@
-use crate::file::pages::{
+use crate::storage::pages::{
     CELL_PTR_SIZE, PageType,
     cell::{Cell, parse_cells},
     header::PageHeader,
@@ -6,7 +6,7 @@ use crate::file::pages::{
     types::PageNumber,
 };
 
-pub(crate) trait TablePage: Sized {
+pub(crate) trait BTreePage: Sized {
     type C: Cell;
     type Key: Ord;
     const PAGE_TYPE: PageType;
@@ -26,23 +26,23 @@ pub(crate) trait TablePage: Sized {
         right: PageSpec,
     ) -> anyhow::Result<(Self, Self, Self::Key)>;
 
-    fn cell_costs(&self) -> Vec<usize> {
+    fn cell_costs(&self) -> anyhow::Result<Vec<usize>> {
         self.cells()
             .iter()
-            .map(|cell| CELL_PTR_SIZE + cell.encoded_len())
-            .collect::<Vec<usize>>()
+            .map(|cell| Ok(CELL_PTR_SIZE + cell.encoded_len()?))
+            .collect::<anyhow::Result<Vec<usize>>>()
     }
 
     fn rightmost_child(&self) -> Option<PageNumber>;
 
     /*=========================== Provided Methods ===========================*/
 
-    fn used_bytes(&self) -> usize {
-        Self::PAGE_TYPE.header_size() + self.cell_costs().iter().sum::<usize>()
+    fn used_bytes(&self) -> anyhow::Result<usize> {
+        Ok(Self::PAGE_TYPE.header_size() + self.cell_costs()?.iter().sum::<usize>())
     }
 
     fn fits(&self, new_cell: &Self::C, ps: PageSpec) -> anyhow::Result<bool> {
-        Ok(self.used_bytes() + CELL_PTR_SIZE + new_cell.encoded_len() <= ps.usable()?)
+        Ok(self.used_bytes()? + CELL_PTR_SIZE + new_cell.encoded_len()? <= ps.usable()?)
     }
 
     /// Sorted insert with the duplicate check, but no size check (splits may overflow transiently)
@@ -50,7 +50,7 @@ pub(crate) trait TablePage: Sized {
         let key = cell.sort_key();
         let idx = self.cells().partition_point(|c| c.sort_key() < key);
         if self.cells().get(idx).is_some_and(|c| c.sort_key() == key) {
-            anyhow::bail!("key {key} already exists");
+            anyhow::bail!("key {:?} already exists", key);
         }
         self.cells_mut().insert(idx, cell);
         Ok(())
@@ -63,7 +63,7 @@ pub(crate) trait TablePage: Sized {
         self.insert_unchecked(cell)
     }
 
-    fn serialize(&self, spec: PageSpec) -> anyhow::Result<Vec<u8>> {
+    fn serialize(&self, ps: PageSpec) -> anyhow::Result<Vec<u8>> {
         if self
             .cells()
             .windows(2)
@@ -71,7 +71,7 @@ pub(crate) trait TablePage: Sized {
         {
             anyhow::bail!("cells not in strictly increasing key order");
         }
-        Self::PAGE_TYPE.serialize(self.cells(), self.rightmost_child(), spec)
+        Self::PAGE_TYPE.serialize(self.cells(), self.rightmost_child(), ps)
     }
 
     fn parse(buf: &[u8], ps: PageSpec) -> anyhow::Result<Self> {
@@ -99,13 +99,13 @@ pub(crate) fn best_split(
         left += costs[split_idx - 1];
 
         // right half would be empty
-        if split_for == SplitKind::TableInteriorSplit && split_idx + 1 >= n {
+        if split_for == SplitKind::InteriorSplit && split_idx + 1 >= n {
             break;
         }
 
         let right = total
             - left
-            - if split_for == SplitKind::TableInteriorSplit {
+            - if split_for == SplitKind::InteriorSplit {
                 costs[split_idx]
             } else {
                 0
@@ -122,6 +122,6 @@ pub(crate) fn best_split(
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum SplitKind {
-    TableLeafSplit,
-    TableInteriorSplit,
+    LeafSplit,
+    InteriorSplit,
 }

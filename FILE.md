@@ -33,9 +33,9 @@
 | 0 | 14 | Header string "Maze format 2\0" |
 | 14 | 1 | Page size $\in$ [9, 16] |
 | 15 | 4 | Page number of first freelist trunk page |
-<!-- | 19 | 4 | Number of free pages | -->
+| 19 | 4 | Number of free pages |
 
-Database header size = 19B (as of now)
+Database header size = 23B (as of now)
 
 ![alt text](theory/images/image.png)
 
@@ -58,3 +58,10 @@ Database header size = 19B (as of now)
 2. when a page is freed for the first time, it becomes the new head freelist trunk page.
 
 **Note**: freelist ops are not yet atomic. `get_fp` and `insert_fp` write a freelist trunk page, and then write to header. if in between a crash occurs, state will be inconsistent on the next init (head = none but count > 0, head = some but count == 0 etc).
+
+# Indexing
+- indexes are non-unique by default
+    - duplicates disambiguated by `row_id`
+    - unique enforced via a pre-insert `range_scan` check when `unique = true`
+## Cross Value ordering
+$\text{Null} \lt \text{(Integer, Real)} \lt \text{Text} \lt \text{Blob}$

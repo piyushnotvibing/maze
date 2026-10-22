@@ -332,23 +332,22 @@ index-aware insert/delete/search in `src/btree/`.
 
 **Checklist**
 
-- [ ] Define index cell types: a leaf cell holds `(key: Record, row_id)`;
+- [x] Define index cell types: a leaf cell holds `(key: Record, row_id)`;
       interior cells hold separator keys + child pointers, same shape as
       table interior pages but comparing on the indexed value instead of
       row id.
-- [ ] Generalize (or duplicate, if cleaner for learning purposes — your
-      call, both are defensible) the Subproject 5/6 insert/split/delete
+- [x] Generalize the Subproject 5/6 insert/split/delete
       logic to work for index trees, parameterized over a key comparator.
-- [ ] Implement `Cursor::seek_index(key) -> impl Iterator<Item = row_id>`
+- [x] Implement `Cursor::seek_index(key) -> impl Iterator<Item = row_id>`
       for equality lookups, and a range variant for `>`/`<`/`BETWEEN`-style
       lookups (ordered iteration from a starting key).
-- [ ] Implement index maintenance: every table insert/update/delete that
+- [x] Implement index maintenance: every table insert/update/delete that
       touches an indexed column must also insert/update/delete the
       corresponding index entry. For now this can be a manual call from
       test code — Subproject 11 wires it automatically.
-- [ ] Decide and document your uniqueness story: are you supporting
-      `UNIQUE` indexes, duplicate keys, or both? Implement accordingly.
-- [ ] Test: build a table with 1000s of rows and a secondary index on one
+- [x] Decide and document your uniqueness story: are you supporting
+      `UNIQUE` indexes, duplicate keys, or both (both)? Implement accordingly.
+- [x] Test: build a table with 1000s of rows and a secondary index on one
       column, verify an index-based lookup returns the same row(s) a full
       table scan + filter would, and that it's actually doing less work
       (e.g. count pages visited, or just trust the structure — but at least

@@ -1,26 +1,28 @@
-use crate::file::{
+use crate::{btree::{DeleteOutcome, InsertOutcome}, storage::{
     pager::Pager,
     pages::{
         Page,
-        interior::{TableInteriorCell, TableInteriorPage},
-        leaf::TableLeafCell,
+        btree_page::BTreePage,
         spec::PageSpec,
-        table::TablePage,
-        types::PageNumber,
+        table::{
+            interior::{TableInteriorCell, TableInteriorPage},
+            leaf::TableLeafCell,
+        },
+        types::{PageNumber, RowID},
     },
-};
+}};
 
-pub struct Cursor<'a> {
+pub struct TableCursor<'a> {
     pager: &'a mut Pager,
     root_pn: PageNumber,
 }
 
-impl<'a> Cursor<'a> {
+impl<'a> TableCursor<'a> {
     pub fn new(pager: &'a mut Pager, root_pn: PageNumber) -> Self {
         Self { pager, root_pn }
     }
 
-    pub fn seek(&mut self, row_id: u64) -> anyhow::Result<Option<TableLeafCell>> {
+    pub fn seek(&mut self, row_id: RowID) -> anyhow::Result<Option<TableLeafCell>> {
         self.seek_from(self.root_pn, row_id)
     }
 
@@ -30,7 +32,7 @@ impl<'a> Cursor<'a> {
         Ok(res)
     }
 
-    pub fn insert(&mut self, row_id: u64, payload: &[u8]) -> anyhow::Result<()> {
+    pub fn insert(&mut self, row_id: RowID, payload: &[u8]) -> anyhow::Result<()> {
         let res = self.insert_into(self.root_pn, row_id, payload)?;
         match res {
             InsertOutcome::Done => Ok(()),
@@ -40,7 +42,7 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    pub fn delete(&mut self, row_id: u64) -> anyhow::Result<()> {
+    pub fn delete(&mut self, row_id: RowID) -> anyhow::Result<()> {
         match self.delete_from(self.root_pn, row_id)? {
             DeleteOutcome::Done => self.shrink_root(),
             DeleteOutcome::DeletedChild => {
@@ -64,7 +66,7 @@ impl<'a> Cursor<'a> {
     fn seek_from(
         &mut self,
         page_number: PageNumber,
-        row_id: u64,
+        row_id: RowID,
     ) -> anyhow::Result<Option<TableLeafCell>> {
         match self.fetch_page(page_number)? {
             Page::TableLeaf(lp) => {
@@ -80,6 +82,11 @@ impl<'a> Cursor<'a> {
             Page::TableInterior(ip) => {
                 let next = ip.child_of(row_id);
                 self.seek_from(next, row_id)
+            }
+            Page::IndexLeaf(_) | Page::IndexInterior(_) => {
+                anyhow::bail!(
+                    "fetched page {page_number}: expected a table page, found an index page"
+                )
             }
         }
     }
@@ -107,6 +114,11 @@ impl<'a> Cursor<'a> {
                 }
                 self.scan_from(ip.rightmost_child, scanned)?;
             }
+            Page::IndexLeaf(_) | Page::IndexInterior(_) => {
+                anyhow::bail!(
+                    "fetched page {page_number}: expected a table page, found an index page"
+                )
+            }
         }
         Ok(())
     }
@@ -114,9 +126,9 @@ impl<'a> Cursor<'a> {
     fn insert_into(
         &mut self,
         page_number: PageNumber,
-        row_id: u64,
+        row_id: RowID,
         payload: &[u8],
-    ) -> anyhow::Result<InsertOutcome<u64>> {
+    ) -> anyhow::Result<InsertOutcome<RowID>> {
         match self.fetch_page(page_number)? {
             Page::TableLeaf(lp) => {
                 if lp.contains(row_id) {
@@ -158,10 +170,15 @@ impl<'a> Cursor<'a> {
                     }
                 }
             }
+            Page::IndexLeaf(_) | Page::IndexInterior(_) => {
+                anyhow::bail!(
+                    "fetched page {page_number}: expected a table page, found an index page"
+                )
+            }
         }
     }
 
-    fn insert_or_split<P: TablePage>(
+    fn insert_or_split<P: BTreePage>(
         &mut self,
         new_cell: P::C,
         mut page: P,
@@ -193,7 +210,7 @@ impl<'a> Cursor<'a> {
         })
     }
 
-    fn split_root(&mut self, right_child: PageNumber, divider: u64) -> anyhow::Result<()> {
+    fn split_root(&mut self, right_child: PageNumber, divider: RowID) -> anyhow::Result<()> {
         let root_pn = self.root_pn;
         let root_bytes = self.pager.get_page(root_pn)?.to_vec();
         // parse before allocating
@@ -213,7 +230,7 @@ impl<'a> Cursor<'a> {
     fn delete_from(
         &mut self,
         page_number: PageNumber,
-        row_id: u64,
+        row_id: RowID,
     ) -> anyhow::Result<DeleteOutcome> {
         match self.fetch_page(page_number)? {
             Page::TableLeaf(mut lp) => {
@@ -244,6 +261,11 @@ impl<'a> Cursor<'a> {
                     }
                 }
             }
+            Page::IndexLeaf(_) | Page::IndexInterior(_) => {
+                anyhow::bail!(
+                    "fetched page {page_number}: expected a table page, found an index page"
+                )
+            }
         }
     }
 
@@ -262,6 +284,11 @@ impl<'a> Cursor<'a> {
                         .write_page(self.root_pn, root_right_child_bytes)?;
                     self.pager.free_page(right_child)?;
                 }
+                Page::IndexLeaf(_) | Page::IndexInterior(_) => {
+                    anyhow::bail!(
+                        "fetched page {}: expected a table page, found an index page", self.root_pn
+                    )
+                }
             }
         }
     }
@@ -270,7 +297,7 @@ impl<'a> Cursor<'a> {
         if cell.overflow_pn.is_none() {
             return Ok(cell.local_payload.clone());
         }
-        let tail_len = cell.total_payload_len as usize - cell.local_payload.len();
+        let tail_len = cell.total_payload_len - cell.local_payload.len();
         let mut full = cell.local_payload.clone();
         full.extend(self.pager.read_overflow(cell.overflow_pn, tail_len)?);
         Ok(full)
@@ -294,32 +321,22 @@ fn repoint_child(
     Ok(())
 }
 
-enum InsertOutcome<Key> {
-    Done,
-    Split {
-        old_child: PageNumber,
-        new_child: PageNumber,
-        divider: Key,
-    },
-}
-
-enum DeleteOutcome {
-    Done,
-    DeletedChild,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::btree::check::check_tree;
-    use crate::file::pages::interior::{TableInteriorCell, TableInteriorPage};
-    use crate::file::pages::leaf::TableLeafPage;
-    use crate::file::pages::spec::PageSpec;
+    use crate::btree::check::check_table_tree as check_tree;
+    use crate::storage::pages::spec::PageSpec;
+    use crate::storage::pages::table::interior::{TableInteriorCell, TableInteriorPage};
+    use crate::storage::pages::table::leaf::TableLeafPage;
 
     const PAGE_SIZE: usize = 512;
 
     fn pn(n: u32) -> PageNumber {
         PageNumber::try_from(n).unwrap()
+    }
+
+    fn rid(n: u64) -> RowID {
+        RowID::try_from(n).unwrap()
     }
 
     fn temp_db_path(tag: &str) -> String {
@@ -332,13 +349,13 @@ mod tests {
         path.to_str().unwrap().to_string()
     }
 
-    fn leaf(row_ids: &[u64]) -> TableLeafPage {
+    fn leaf(row_ids: &[RowID]) -> TableLeafPage {
         TableLeafPage {
             cells: row_ids
                 .iter()
                 .map(|&row_id| TableLeafCell {
                     row_id,
-                    local_payload: row_id.to_be_bytes().to_vec(),
+                    local_payload: row_id.get().to_be_bytes().to_vec(),
                     total_payload_len: 8,
                     overflow_pn: None,
                 })
@@ -346,7 +363,7 @@ mod tests {
         }
     }
 
-    fn write_leaf(pager: &mut Pager, page_number: PageNumber, row_ids: &[u64]) {
+    fn write_leaf(pager: &mut Pager, page_number: PageNumber, row_ids: &[RowID]) {
         let bytes = Page::TableLeaf(leaf(row_ids))
             .serialize(PageSpec::new(PAGE_SIZE as usize, page_number))
             .unwrap();
@@ -376,10 +393,38 @@ mod tests {
     fn build_tree(path: &str) -> Pager {
         let mut pager = Pager::new(path, PAGE_SIZE).unwrap();
 
-        write_leaf(&mut pager, pn(10), &[1, 2, 3]);
-        write_leaf(&mut pager, pn(11), &[10, 20, 30]);
-        write_leaf(&mut pager, pn(12), &[100, 150]);
-        write_leaf(&mut pager, pn(13), &[500, 600, 700]);
+        write_leaf(
+            &mut pager,
+            pn(10),
+            &[
+                RowID::try_from(1).unwrap(),
+                RowID::try_from(2).unwrap(),
+                RowID::try_from(3).unwrap(),
+            ],
+        );
+        write_leaf(
+            &mut pager,
+            pn(11),
+            &[
+                RowID::try_from(10).unwrap(),
+                RowID::try_from(20).unwrap(),
+                RowID::try_from(30).unwrap(),
+            ],
+        );
+        write_leaf(
+            &mut pager,
+            pn(12),
+            &[RowID::try_from(100).unwrap(), RowID::try_from(150).unwrap()],
+        );
+        write_leaf(
+            &mut pager,
+            pn(13),
+            &[
+                RowID::try_from(500).unwrap(),
+                RowID::try_from(600).unwrap(),
+                RowID::try_from(700).unwrap(),
+            ],
+        );
 
         write_interior(
             &mut pager,
@@ -387,7 +432,7 @@ mod tests {
             TableInteriorPage {
                 cells: vec![TableInteriorCell {
                     left_child: pn(10),
-                    row_id: 3,
+                    row_id: RowID::try_from(3).unwrap(),
                 }],
                 rightmost_child: pn(11),
             },
@@ -398,7 +443,7 @@ mod tests {
             TableInteriorPage {
                 cells: vec![TableInteriorCell {
                     left_child: pn(12),
-                    row_id: 150,
+                    row_id: RowID::try_from(150).unwrap(),
                 }],
                 rightmost_child: pn(13),
             },
@@ -410,7 +455,7 @@ mod tests {
             TableInteriorPage {
                 cells: vec![TableInteriorCell {
                     left_child: pn(5),
-                    row_id: 30,
+                    row_id: RowID::try_from(30).unwrap(),
                 }],
                 rightmost_child: pn(6),
             },
@@ -423,12 +468,12 @@ mod tests {
     fn seek_finds_every_row_that_exists() {
         let path = temp_db_path("seek_finds");
         let mut pager = build_tree(&path);
-        let mut cursor = Cursor::new(&mut pager, pn(1));
+        let mut cursor = TableCursor::new(&mut pager, pn(1));
 
         for &row_id in &[1u64, 2, 3, 10, 20, 30, 100, 150, 500, 600, 700] {
-            let found = cursor.seek(row_id).unwrap();
+            let found = cursor.seek(RowID::try_from(row_id).unwrap()).unwrap();
             assert_eq!(
-                found.map(|c| c.row_id),
+                found.map(|c| c.row_id.get()),
                 Some(row_id),
                 "expected to find row {row_id}"
             );
@@ -441,13 +486,17 @@ mod tests {
     fn seek_returns_none_for_rows_that_dont_exist() {
         let path = temp_db_path("seek_none");
         let mut pager = build_tree(&path);
-        let mut cursor = Cursor::new(&mut pager, pn(1));
+        let mut cursor = TableCursor::new(&mut pager, pn(1));
 
-        // includes: below everything, between leaves within one subtree,
-        // between the two second-level subtrees, and above everything.
-        for &row_id in &[0u64, 4, 15, 50, 99, 151, 999] {
+        // row id 0 can't even be constructed as a `RowID` (same rule as `PageNumber`),
+        // so the "below everything" boundary case is rejected at construction, not at seek.
+        assert!(RowID::try_from(0).is_err());
+
+        // remaining cases: between leaves within one subtree, between the two
+        // second-level subtrees, and above everything.
+        for &row_id in &[4u64, 15, 50, 99, 151, 999] {
             assert_eq!(
-                cursor.seek(row_id).unwrap(),
+                cursor.seek(rid(row_id)).unwrap(),
                 None,
                 "expected row {row_id} to be absent"
             );
@@ -460,15 +509,15 @@ mod tests {
     fn insert_100_ascending_rows_all_remain_reachable() {
         let path = temp_db_path("insert_100_ascending");
         let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
-        let mut cursor = Cursor::new(&mut pager, pn(1));
+        let mut cursor = TableCursor::new(&mut pager, pn(1));
 
         for i in 1u64..=100 {
-            cursor.insert(i, &i.to_be_bytes()).unwrap();
+            cursor.insert(rid(i), &i.to_be_bytes()).unwrap();
         }
 
         for i in 1u64..=100 {
             assert_eq!(
-                cursor.seek(i).unwrap().map(|c| c.row_id),
+                cursor.seek(rid(i)).unwrap().map(|c| c.row_id.get()),
                 Some(i),
                 "row {i} should be findable via seek after inserting 100 ascending rows"
             );
@@ -478,7 +527,7 @@ mod tests {
             .scan()
             .unwrap()
             .into_iter()
-            .map(|c| c.row_id)
+            .map(|c| c.row_id.get())
             .collect();
         assert_eq!(scanned, (1u64..=100).collect::<Vec<u64>>());
 
@@ -489,13 +538,13 @@ mod tests {
     fn scan_returns_every_row_in_ascending_order() {
         let path = temp_db_path("scan_order");
         let mut pager = build_tree(&path);
-        let mut cursor = Cursor::new(&mut pager, pn(1));
+        let mut cursor = TableCursor::new(&mut pager, pn(1));
 
         let got: Vec<u64> = cursor
             .scan()
             .unwrap()
             .into_iter()
-            .map(|c| c.row_id)
+            .map(|c| c.row_id.get())
             .collect();
 
         assert_eq!(got, vec![1, 2, 3, 10, 20, 30, 100, 150, 500, 600, 700]);
@@ -508,13 +557,13 @@ mod tests {
         let path = temp_db_path("reopen");
         {
             let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
-            let mut cursor = Cursor::new(&mut pager, pn(1));
+            let mut cursor = TableCursor::new(&mut pager, pn(1));
             for i in 1u64..=200 {
-                cursor.insert(i, &i.to_be_bytes()).unwrap();
+                cursor.insert(rid(i), &i.to_be_bytes()).unwrap();
             }
         }
         let mut pager = Pager::init(&path).unwrap();
-        let rows = Cursor::new(&mut pager, pn(1)).scan().unwrap();
+        let rows = TableCursor::new(&mut pager, pn(1)).scan().unwrap();
         assert_eq!(rows.len(), 200);
         std::fs::remove_file(&path).ok();
     }
@@ -536,16 +585,16 @@ mod tests {
     fn insert_5000_rows_all_remain_reachable() {
         let path = temp_db_path("insert_5000_ascending");
         let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
-        let mut cursor = Cursor::new(&mut pager, pn(1));
+        let mut cursor = TableCursor::new(&mut pager, pn(1));
 
         let data = shuffled(5000);
 
         for elem in &data {
-            cursor.insert(*elem, &elem.to_be_bytes()).unwrap();
+            cursor.insert(rid(*elem), &elem.to_be_bytes()).unwrap();
         }
         for elem in &data {
-            let got = cursor.seek(*elem).unwrap().unwrap();
-            assert_eq!(got.row_id, *elem);
+            let got = cursor.seek(rid(*elem)).unwrap().unwrap();
+            assert_eq!(got.row_id.get(), *elem);
             assert_eq!(got.local_payload, elem.to_be_bytes()); // you currently only check row_id
         }
 
@@ -553,7 +602,7 @@ mod tests {
             .scan()
             .unwrap()
             .into_iter()
-            .map(|c| c.row_id)
+            .map(|c| c.row_id.get())
             .collect();
         assert_eq!(scanned.len(), 5000);
         assert_eq!(scanned, (1u64..=5000).collect::<Vec<u64>>());
@@ -565,12 +614,12 @@ mod tests {
     fn failed_inserts_do_not_grow_the_file() {
         let path = temp_db_path("no_leak");
         let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
-        let mut cursor = Cursor::new(&mut pager, pn(1));
+        let mut cursor = TableCursor::new(&mut pager, pn(1));
 
-        cursor.insert(1, b"x").unwrap();
+        cursor.insert(rid(1), b"x").unwrap();
         let size = std::fs::metadata(&path).unwrap().len();
 
-        assert!(cursor.insert(1, b"dup").is_err()); // duplicate key
+        assert!(cursor.insert(rid(1), b"dup").is_err()); // duplicate key
         assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
         assert_eq!(cursor.scan().unwrap().len(), 1);
 
@@ -578,12 +627,12 @@ mod tests {
         // is page_size / 4 = 128, so a 600-byte payload spills 472 bytes into exactly one
         // overflow page (its capacity is page_size - 4 = 508).
         let big = vec![0xABu8; 600];
-        cursor.insert(2, &big).unwrap();
+        cursor.insert(rid(2), &big).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
             size + PAGE_SIZE as u64
         );
-        assert_eq!(cursor.seek(2).unwrap().unwrap().local_payload, big);
+        assert_eq!(cursor.seek(rid(2)).unwrap().unwrap().local_payload, big);
 
         std::fs::remove_file(&path).ok();
     }
@@ -599,17 +648,17 @@ mod tests {
         let mut expected: Vec<(u64, Vec<u8>)> =
             (1u64..=30).map(|i| (i * 2, vec![i as u8; 10])).collect();
         {
-            let mut cursor = Cursor::new(&mut pager, pn(1));
+            let mut cursor = TableCursor::new(&mut pager, pn(1));
             for (row_id, payload) in &expected {
-                cursor.insert(*row_id, payload).unwrap();
+                cursor.insert(rid(*row_id), payload).unwrap();
             }
         }
         // precondition: the 30 small rows still fit in the root leaf, so no split has happened
         assert_eq!(std::fs::metadata(&path).unwrap().len(), PAGE_SIZE as u64);
 
         let big = vec![0xABu8; 300];
-        let mut cursor = Cursor::new(&mut pager, pn(1));
-        cursor.insert(big_id, &big).unwrap();
+        let mut cursor = TableCursor::new(&mut pager, pn(1));
+        cursor.insert(rid(big_id), &big).unwrap();
 
         expected.push((big_id, big));
         expected.sort_by_key(|(id, _)| *id);
@@ -617,7 +666,7 @@ mod tests {
         // every row is reachable, with its exact payload
         for (id, payload) in &expected {
             let cell = cursor
-                .seek(*id)
+                .seek(rid(*id))
                 .unwrap()
                 .unwrap_or_else(|| panic!("row {id} is missing after the split"));
             assert_eq!(
@@ -630,7 +679,7 @@ mod tests {
             .scan()
             .unwrap()
             .into_iter()
-            .map(|c| (c.row_id, c.local_payload))
+            .map(|c| (c.row_id.get(), c.local_payload))
             .collect();
         assert_eq!(scanned, expected);
 
@@ -670,15 +719,15 @@ mod tests {
         // accommodate, so this now succeeds instead of erroring.
         let path = temp_db_path("big_cell_middle");
         let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
-        let mut cursor = Cursor::new(&mut pager, pn(1));
+        let mut cursor = TableCursor::new(&mut pager, pn(1));
         for i in 1u64..=30 {
-            cursor.insert(i * 2, &[i as u8; 10]).unwrap();
+            cursor.insert(rid(i * 2), &[i as u8; 10]).unwrap();
         }
 
         let big = vec![0xABu8; 300];
-        cursor.insert(31, &big).unwrap();
+        cursor.insert(rid(31), &big).unwrap();
 
-        assert_eq!(cursor.seek(31).unwrap().unwrap().local_payload, big);
+        assert_eq!(cursor.seek(rid(31)).unwrap().unwrap().local_payload, big);
         assert_eq!(cursor.scan().unwrap().len(), 31);
         std::fs::remove_file(&path).ok();
     }
@@ -689,18 +738,21 @@ mod tests {
         let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
         write_leaf(&mut pager, pn(2), &[]); // an empty leaf root that is not page 1
         {
-            let mut cursor = Cursor::new(&mut pager, pn(2));
+            let mut cursor = TableCursor::new(&mut pager, pn(2));
             for i in 1u64..=300 {
-                cursor.insert(i, &i.to_be_bytes()).unwrap();
+                cursor.insert(rid(i), &i.to_be_bytes()).unwrap();
             }
             for i in 1u64..=300 {
-                assert_eq!(cursor.seek(i).unwrap().map(|c| c.row_id), Some(i));
+                assert_eq!(
+                    cursor.seek(rid(i)).unwrap().map(|c| c.row_id.get()),
+                    Some(i)
+                );
             }
             let ids: Vec<u64> = cursor
                 .scan()
                 .unwrap()
                 .into_iter()
-                .map(|c| c.row_id)
+                .map(|c| c.row_id.get())
                 .collect();
             assert_eq!(ids, (1u64..=300).collect::<Vec<u64>>());
         }
@@ -717,12 +769,12 @@ mod tests {
     fn ensure_5000_row_tree_stats_are_correct() {
         let path = temp_db_path("insert_5000_ascending");
         let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
-        let mut cursor = Cursor::new(&mut pager, pn(1));
+        let mut cursor = TableCursor::new(&mut pager, pn(1));
 
         let data = shuffled(5000);
 
         for elem in &data {
-            cursor.insert(*elem, &elem.to_be_bytes()).unwrap();
+            cursor.insert(rid(*elem), &elem.to_be_bytes()).unwrap();
         }
 
         let stats = check_tree(&mut pager, pn(1)).unwrap();
@@ -738,14 +790,14 @@ mod tests {
     fn delete_removes_a_single_row_and_leaves_the_rest_reachable() {
         let path = temp_db_path("delete_single");
         let mut pager = build_tree(&path);
-        let mut cursor = Cursor::new(&mut pager, pn(1));
+        let mut cursor = TableCursor::new(&mut pager, pn(1));
 
-        cursor.delete(100).unwrap();
+        cursor.delete(rid(100)).unwrap();
 
-        assert_eq!(cursor.seek(100).unwrap(), None);
+        assert_eq!(cursor.seek(rid(100)).unwrap(), None);
         for &row_id in &[1u64, 2, 3, 10, 20, 30, 150, 500, 600, 700] {
             assert_eq!(
-                cursor.seek(row_id).unwrap().map(|c| c.row_id),
+                cursor.seek(rid(row_id)).unwrap().map(|c| c.row_id.get()),
                 Some(row_id),
                 "expected row {row_id} to still be reachable"
             );
@@ -754,7 +806,7 @@ mod tests {
             .scan()
             .unwrap()
             .into_iter()
-            .map(|c| c.row_id)
+            .map(|c| c.row_id.get())
             .collect();
         assert_eq!(scanned, vec![1, 2, 3, 10, 20, 30, 150, 500, 600, 700]);
 
@@ -773,16 +825,16 @@ mod tests {
         let path = temp_db_path("collapse_left_cell");
         let mut pager = build_tree(&path);
         {
-            let mut cursor = Cursor::new(&mut pager, pn(1));
+            let mut cursor = TableCursor::new(&mut pager, pn(1));
             for row_id in [1u64, 2, 3] {
-                cursor.delete(row_id).unwrap();
+                cursor.delete(rid(row_id)).unwrap();
             }
 
             let scanned: Vec<u64> = cursor
                 .scan()
                 .unwrap()
                 .into_iter()
-                .map(|c| c.row_id)
+                .map(|c| c.row_id.get())
                 .collect();
             assert_eq!(scanned, vec![10, 20, 30, 100, 150, 500, 600, 700]);
         }
@@ -798,6 +850,9 @@ mod tests {
                 );
             }
             Page::TableLeaf(_) => panic!("page 5 should still be an interior page"),
+            Page::IndexLeaf(_) | Page::IndexInterior(_) => {
+                panic!("parsed page 5: expected a table page, found an index page")
+            }
         }
 
         let stats = check_tree(&mut pager, pn(1)).unwrap();
@@ -813,16 +868,16 @@ mod tests {
         let path = temp_db_path("collapse_rightmost");
         let mut pager = build_tree(&path);
         {
-            let mut cursor = Cursor::new(&mut pager, pn(1));
+            let mut cursor = TableCursor::new(&mut pager, pn(1));
             for row_id in [10u64, 20, 30] {
-                cursor.delete(row_id).unwrap();
+                cursor.delete(rid(row_id)).unwrap();
             }
 
             let scanned: Vec<u64> = cursor
                 .scan()
                 .unwrap()
                 .into_iter()
-                .map(|c| c.row_id)
+                .map(|c| c.row_id.get())
                 .collect();
             assert_eq!(scanned, vec![1, 2, 3, 100, 150, 500, 600, 700]);
         }
@@ -838,6 +893,9 @@ mod tests {
                 );
             }
             Page::TableLeaf(_) => panic!("page 5 should still be an interior page"),
+            Page::IndexLeaf(_) | Page::IndexInterior(_) => {
+                panic!("parsed page 5: expected a table page, found an index page")
+            }
         }
 
         let stats = check_tree(&mut pager, pn(1)).unwrap();
@@ -856,16 +914,16 @@ mod tests {
         let path = temp_db_path("collapse_both_children");
         let mut pager = build_tree(&path);
         {
-            let mut cursor = Cursor::new(&mut pager, pn(1));
+            let mut cursor = TableCursor::new(&mut pager, pn(1));
             for row_id in [1u64, 2, 3, 10, 20, 30] {
-                cursor.delete(row_id).unwrap();
+                cursor.delete(rid(row_id)).unwrap();
             }
 
             let scanned: Vec<u64> = cursor
                 .scan()
                 .unwrap()
                 .into_iter()
-                .map(|c| c.row_id)
+                .map(|c| c.row_id.get())
                 .collect();
             assert_eq!(scanned, vec![100, 150, 500, 600, 700]);
         }
@@ -880,6 +938,9 @@ mod tests {
                 assert_eq!(ip.rightmost_child, pn(13));
             }
             Page::TableLeaf(_) => panic!("root should still be an interior page"),
+            Page::IndexLeaf(_) | Page::IndexInterior(_) => {
+                panic!("fetched root: expected a table page, found an index page")
+            }
         }
 
         let stats = check_tree(&mut pager, pn(1)).unwrap();
@@ -913,8 +974,8 @@ mod tests {
         let path = temp_db_path("stacked_shrink");
         let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
 
-        write_leaf(&mut pager, pn(2), &[1, 2, 3, 4, 5]);
-        write_leaf(&mut pager, pn(7), &[10, 20, 30]);
+        write_leaf(&mut pager, pn(2), &[rid(1), rid(2), rid(3), rid(4), rid(5)]);
+        write_leaf(&mut pager, pn(7), &[rid(10), rid(20), rid(30)]);
         write_interior(&mut pager, pn(4), TableInteriorPage::new(Vec::new(), pn(7)));
         write_interior(&mut pager, pn(3), TableInteriorPage::new(Vec::new(), pn(4)));
         write_interior(
@@ -923,23 +984,23 @@ mod tests {
             TableInteriorPage::new(
                 vec![TableInteriorCell {
                     left_child: pn(2),
-                    row_id: 5,
+                    row_id: rid(5),
                 }],
                 pn(3),
             ),
         );
 
         {
-            let mut cursor = Cursor::new(&mut pager, pn(1));
+            let mut cursor = TableCursor::new(&mut pager, pn(1));
             for row_id in 1u64..=5 {
-                cursor.delete(row_id).unwrap();
+                cursor.delete(rid(row_id)).unwrap();
             }
 
             let scanned: Vec<u64> = cursor
                 .scan()
                 .unwrap()
                 .into_iter()
-                .map(|c| c.row_id)
+                .map(|c| c.row_id.get())
                 .collect();
             assert_eq!(scanned, vec![10, 20, 30]);
         }
@@ -948,10 +1009,13 @@ mod tests {
         let root_bytes = pager.get_page(pn(1)).unwrap().to_vec();
         match Page::parse(&root_bytes, pager.spec(pn(1))).unwrap() {
             Page::TableLeaf(lp) => {
-                let ids: Vec<u64> = lp.cells.iter().map(|c| c.row_id).collect();
+                let ids: Vec<u64> = lp.cells.iter().map(|c| c.row_id.get()).collect();
                 assert_eq!(ids, vec![10, 20, 30]);
             }
             Page::TableInterior(_) => panic!("root should have collapsed all the way to a leaf"),
+            Page::IndexLeaf(_) | Page::IndexInterior(_) => {
+                panic!("parsed root: expected a table page, found an index page")
+            }
         }
 
         let stats = check_tree(&mut pager, pn(1)).unwrap();
@@ -971,24 +1035,24 @@ mod tests {
     fn delete_of_missing_row_errors_and_leaves_tree_unchanged() {
         let path = temp_db_path("delete_missing");
         let mut pager = build_tree(&path);
-        let mut cursor = Cursor::new(&mut pager, pn(1));
+        let mut cursor = TableCursor::new(&mut pager, pn(1));
 
         let size_before = std::fs::metadata(&path).unwrap().len();
         let scan_before: Vec<u64> = cursor
             .scan()
             .unwrap()
             .into_iter()
-            .map(|c| c.row_id)
+            .map(|c| c.row_id.get())
             .collect();
 
-        assert!(cursor.delete(999).is_err());
+        assert!(cursor.delete(rid(999)).is_err());
 
         assert_eq!(std::fs::metadata(&path).unwrap().len(), size_before);
         let scan_after: Vec<u64> = cursor
             .scan()
             .unwrap()
             .into_iter()
-            .map(|c| c.row_id)
+            .map(|c| c.row_id.get())
             .collect();
         assert_eq!(scan_after, scan_before);
 
@@ -1007,34 +1071,34 @@ mod tests {
 
         let mut model: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         {
-            let mut cursor = Cursor::new(&mut pager, pn(1));
+            let mut cursor = TableCursor::new(&mut pager, pn(1));
             for &k in &insert_order {
-                cursor.insert(k, &k.to_be_bytes()).unwrap();
+                cursor.insert(rid(k), &k.to_be_bytes()).unwrap();
                 model.insert(k);
             }
             let scanned: Vec<u64> = cursor
                 .scan()
                 .unwrap()
                 .into_iter()
-                .map(|c| c.row_id)
+                .map(|c| c.row_id.get())
                 .collect();
             assert_eq!(scanned, model.iter().copied().collect::<Vec<u64>>());
         }
 
         for &k in &delete_order {
             {
-                let mut cursor = Cursor::new(&mut pager, pn(1));
-                cursor.delete(k).unwrap();
+                let mut cursor = TableCursor::new(&mut pager, pn(1));
+                cursor.delete(rid(k)).unwrap();
             }
             model.remove(&k);
 
             let scanned: Vec<u64> = {
-                let mut cursor = Cursor::new(&mut pager, pn(1));
+                let mut cursor = TableCursor::new(&mut pager, pn(1));
                 cursor
                     .scan()
                     .unwrap()
                     .into_iter()
-                    .map(|c| c.row_id)
+                    .map(|c| c.row_id.get())
                     .collect()
             };
             assert_eq!(
@@ -1057,9 +1121,9 @@ mod tests {
         // Collapse both of mid1's children: frees pages 5, 6, 10, 11
         // (same shape as `draining_both_children_of_a_mid_node_...`).
         {
-            let mut cursor = Cursor::new(&mut pager, pn(1));
+            let mut cursor = TableCursor::new(&mut pager, pn(1));
             for row_id in [1u64, 2, 3, 10, 20, 30] {
-                cursor.delete(row_id).unwrap();
+                cursor.delete(rid(row_id)).unwrap();
             }
         }
         let free_before: std::collections::HashSet<PageNumber> =
@@ -1074,8 +1138,8 @@ mod tests {
         let mut reused = false;
         for i in 0u64..12 {
             let row_id = 1000 + i;
-            Cursor::new(&mut pager, pn(1))
-                .insert(row_id, &vec![0xABu8; 400])
+            TableCursor::new(&mut pager, pn(1))
+                .insert(rid(row_id), &vec![0xABu8; 400])
                 .unwrap();
             inserted.push(row_id);
             assert_eq!(
@@ -1096,11 +1160,11 @@ mod tests {
         );
 
         // Old rows plus new rows are all reachable, tree invariants hold.
-        let scanned: Vec<u64> = Cursor::new(&mut pager, pn(1))
+        let scanned: Vec<u64> = TableCursor::new(&mut pager, pn(1))
             .scan()
             .unwrap()
             .into_iter()
-            .map(|c| c.row_id)
+            .map(|c| c.row_id.get())
             .collect();
         let mut expected = vec![100, 150, 500, 600, 700];
         expected.extend_from_slice(&inserted);
@@ -1114,22 +1178,22 @@ mod tests {
     fn seek_and_scan_resolve_mixed_local_and_overflowing_payloads() {
         let path = temp_db_path("mixed_overflow");
         let mut pager = Pager::new(&path, PAGE_SIZE).unwrap();
-        let mut cursor = Cursor::new(&mut pager, pn(1));
+        let mut cursor = TableCursor::new(&mut pager, pn(1));
 
         // local cap for a 512-byte page is 128 bytes.
         let rows: Vec<(u64, Vec<u8>)> = vec![
-            (1, vec![0x11u8; 10]),                 // well under the cap
-            (2, vec![0x22u8; 128]),                // exactly at the cap: no overflow
-            (3, vec![0x33u8; 129]),                // one byte over: needs one overflow page
-            (4, vec![0x44u8; 508 + 508 + 37]),      // spans several overflow pages
+            (1, vec![0x11u8; 10]),             // well under the cap
+            (2, vec![0x22u8; 128]),            // exactly at the cap: no overflow
+            (3, vec![0x33u8; 129]),            // one byte over: needs one overflow page
+            (4, vec![0x44u8; 508 + 508 + 37]), // spans several overflow pages
         ];
         for (id, payload) in &rows {
-            cursor.insert(*id, payload).unwrap();
+            cursor.insert(rid(*id), payload).unwrap();
         }
 
         for (id, payload) in &rows {
             let got = cursor
-                .seek(*id)
+                .seek(rid(*id))
                 .unwrap()
                 .unwrap_or_else(|| panic!("row {id} missing"));
             assert_eq!(&got.local_payload, payload, "seek mismatch for row {id}");
@@ -1139,7 +1203,7 @@ mod tests {
             .scan()
             .unwrap()
             .into_iter()
-            .map(|c| (c.row_id, c.local_payload))
+            .map(|c| (c.row_id.get(), c.local_payload))
             .collect();
         assert_eq!(scanned, rows);
 
@@ -1154,15 +1218,15 @@ mod tests {
         // 300-byte payload: local cap is 128, so this spills into exactly one overflow page
         // (the tail is 172 bytes, under the 508-byte-per-page overflow capacity).
         {
-            let mut cursor = Cursor::new(&mut pager, pn(1));
-            cursor.insert(1, &vec![0xABu8; 300]).unwrap();
+            let mut cursor = TableCursor::new(&mut pager, pn(1));
+            cursor.insert(rid(1), &vec![0xABu8; 300]).unwrap();
         }
         assert_eq!(pager.count_fp().unwrap(), 0);
         let size_with_overflow = std::fs::metadata(&path).unwrap().len();
 
         {
-            let mut cursor = Cursor::new(&mut pager, pn(1));
-            cursor.delete(1).unwrap();
+            let mut cursor = TableCursor::new(&mut pager, pn(1));
+            cursor.delete(rid(1)).unwrap();
         }
 
         // the overflow page is back on the freelist, not leaked.

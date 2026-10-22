@@ -1,11 +1,11 @@
-use crate::file::{
+use crate::storage::{
     pages::{
         PageType,
+        btree_page::{BTreePage, SplitKind, best_split},
         bytes::read_word_u32_be,
         cell::Cell,
         spec::PageSpec,
-        table::{SplitKind, TablePage, best_split},
-        types::PageNumber,
+        types::{PageNumber, RowID},
     },
     varint,
 };
@@ -20,13 +20,13 @@ impl TableLeafPage {
         Self { cells }
     }
 
-    pub fn contains(&self, row_id: u64) -> bool {
+    pub fn contains(&self, row_id: RowID) -> bool {
         self.cells
             .binary_search_by_key(&row_id, |cell| cell.row_id)
             .is_ok()
     }
 
-    pub fn delete(&mut self, row_id: u64) -> anyhow::Result<TableLeafCell> {
+    pub fn delete(&mut self, row_id: RowID) -> anyhow::Result<TableLeafCell> {
         let delete_idx = self.cells.binary_search_by_key(&row_id, |cell| cell.row_id);
         if delete_idx.is_err() {
             anyhow::bail!("cannot delete row_id {row_id} that does not exist in the tree")
@@ -38,7 +38,7 @@ impl TableLeafPage {
     }
 }
 
-impl TablePage for TableLeafPage {
+impl BTreePage for TableLeafPage {
     type C = TableLeafCell;
     type Key = <Self::C as Cell>::Key;
 
@@ -49,7 +49,7 @@ impl TablePage for TableLeafPage {
         rightmost_child: Option<PageNumber>,
     ) -> anyhow::Result<Self> {
         if rightmost_child.is_some() {
-            anyhow::bail!("leaf page cannot have a rightmost child")
+            anyhow::bail!("table leaf page cannot have a rightmost child")
         }
 
         Ok(Self { cells })
@@ -69,13 +69,13 @@ impl TablePage for TableLeafPage {
         new_cell: Self::C,
         left: PageSpec,
         right: PageSpec,
-    ) -> anyhow::Result<(Self, Self, u64)> {
+    ) -> anyhow::Result<(Self, Self, RowID)> {
         self.insert_unchecked(new_cell)?;
 
         let split_idx = best_split(
-            &self.cell_costs(),
-            SplitKind::TableLeafSplit,
-            PageType::TableLeaf.header_size(),
+            &self.cell_costs()?,
+            SplitKind::LeafSplit,
+            Self::PAGE_TYPE.header_size(),
             left.usable()?,
             right.usable()?,
         )
@@ -102,7 +102,7 @@ impl TablePage for TableLeafPage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableLeafCell {
-    pub row_id: u64, // varint encoded on disk
+    pub row_id: RowID, // varint encoded on disk
     pub local_payload: Vec<u8>,
     pub total_payload_len: usize, // full logical length
     pub overflow_pn: Option<PageNumber>,
@@ -110,7 +110,7 @@ pub struct TableLeafCell {
 
 impl TableLeafCell {
     /// used when there's no overflow
-    pub fn new(row_id: u64, payload: &[u8]) -> Self {
+    pub fn new(row_id: RowID, payload: &[u8]) -> Self {
         Self {
             row_id,
             local_payload: payload.to_vec(),
@@ -120,7 +120,7 @@ impl TableLeafCell {
     }
 
     pub fn with_overflow(
-        row_id: u64,
+        row_id: RowID,
         local_payload: Vec<u8>,
         total_payload_len: usize,
         overflow_pn: Option<PageNumber>,
@@ -135,26 +135,27 @@ impl TableLeafCell {
 }
 
 impl Cell for TableLeafCell {
-    type Key = u64;
+    type Key = RowID;
 
-    fn serialize(&self) -> Vec<u8> {
+    // only reason its anyhow::Result<Vec<u8>> is because indexes need it, no need here, always returns Ok().
+    fn serialize(&self) -> anyhow::Result<Vec<u8>> {
         let mut bytes = varint::encode(self.total_payload_len as u64);
-        bytes.extend(varint::encode(self.row_id));
+        bytes.extend(varint::encode(self.row_id.get()));
         bytes.extend_from_slice(&self.local_payload);
         if let Some(n) = self.overflow_pn {
             bytes.extend(n.get().to_be_bytes());
         }
-        bytes
+        Ok(bytes)
     }
 
-    fn encoded_len(&self) -> usize {
-        varint::encode(self.total_payload_len as u64).len()
-            + varint::encode(self.row_id).len()
+    fn encoded_len(&self) -> anyhow::Result<usize> {
+        Ok(varint::encode(self.total_payload_len as u64).len()
+            + varint::encode(self.row_id.get()).len()
             + self.local_payload.len()
-            + if self.overflow_pn.is_some() { 4 } else { 0 } // overflow page number = u32 = 4B, only when present
+            + if self.overflow_pn.is_some() { 4 } else { 0 }) // overflow page number = u32 = 4B, only when present
     }
 
-    fn sort_key(&self) -> u64 {
+    fn sort_key(&self) -> RowID {
         self.row_id
     }
 
@@ -188,6 +189,7 @@ impl Cell for TableLeafCell {
         };
 
         let total_payload_len = total_payload_len as usize;
+        let row_id = RowID::try_from(row_id)?;
 
         Ok(Self {
             row_id,
@@ -201,32 +203,33 @@ impl Cell for TableLeafCell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{
+    use crate::storage::{
         header::MAZE_HEADER_SIZE,
-        pages::{Page, PageNumber, leaf::TableLeafCell},
-        record::{Record, Value},
+        pages::{Page, PageNumber, types::RowID},
+        record::{Record, values::Value},
     };
 
     // Build one cell: varint(payload len) | varint(row_id) | payload
-    fn cell_bytes(row_id: u64, payload: &[u8]) -> Vec<u8> {
+    fn cell_bytes(row_id: RowID, payload: &[u8]) -> Vec<u8> {
         let mut c = varint::encode(payload.len() as u64);
-        c.extend(varint::encode(row_id));
+        c.extend(varint::encode(row_id.get()));
         c.extend_from_slice(payload);
         c
     }
 
     #[test]
     fn table_leaf_cell_roundtrip() {
+        let row_id = RowID::try_from(300).unwrap();
         let cell = TableLeafCell {
-            row_id: 300,
+            row_id,
             local_payload: b"abc".to_vec(),
             total_payload_len: 3,
             overflow_pn: None,
         };
         let ps = PageSpec::fresh(512);
-        let parsed = TableLeafCell::parse(cell.serialize().as_slice(), ps).unwrap();
+        let parsed = TableLeafCell::parse(cell.serialize().unwrap().as_slice(), ps).unwrap();
         assert_eq!(
-            (parsed.row_id, parsed.local_payload),
+            (parsed.row_id.get(), parsed.local_payload),
             (300, b"abc".to_vec())
         );
     }
@@ -261,7 +264,7 @@ mod tests {
             .iter()
             .map(|(id, values)| {
                 let payload = Record::new(values.clone()).unwrap().encode();
-                cell_bytes(*id, &payload)
+                cell_bytes(RowID::try_from(*id).unwrap(), &payload)
             })
             .collect();
 
@@ -299,7 +302,8 @@ mod tests {
             assert_eq!(leaf.cells.len(), rows.len());
             for (cell, (row_id, expected)) in leaf.cells.iter().zip(&rows) {
                 assert_eq!(cell.row_id, *row_id);
-                assert_eq!(&Record::decode(&cell.local_payload).unwrap(), expected);
+                let (got, _) = Record::decode(&cell.local_payload).unwrap();
+                assert_eq!(&got, expected);
             }
         } else {
             panic!("invalid page type")
@@ -380,12 +384,12 @@ mod tests {
             // odd ids: before, between and after the 30 small rows
             let page = TableLeafPage::new(
                 (1u64..=30)
-                    .map(|i| TableLeafCell::new(i * 2, &[i as u8; 10]))
+                    .map(|i| TableLeafCell::new(RowID::try_from(i * 2).unwrap(), &[i as u8; 10]))
                     .collect(),
             );
             let full_payload = vec![0xABu8; 300];
             let big = TableLeafCell::with_overflow(
-                big_id,
+                RowID::try_from(big_id).unwrap(),
                 full_payload[..cap].to_vec(),
                 full_payload.len(),
                 Some(PageNumber::try_from(999).unwrap()),

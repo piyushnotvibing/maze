@@ -1,4 +1,4 @@
-use crate::file::pages::{spec::PageSpec, types::PageNumber};
+use crate::storage::pages::{spec::PageSpec, types::PageNumber};
 
 const TRUNK_PAGE_HEADER_SIZE: usize = 8;
 const FREE_PAGE_COUNT_OFFSET: usize = 4;
@@ -61,7 +61,7 @@ impl FreeListTrunkPage {
                             "either the count of free pages is wrong or this buffer is corrupted"
                         )
                     })?;
-                let free = free_pn_bytes
+                free_pn_bytes
                     .chunks(4)
                     .map(|chunk| {
                         match PageNumber::try_from(u32::from_be_bytes(match chunk.try_into() {
@@ -74,9 +74,7 @@ impl FreeListTrunkPage {
                             }
                         }
                     })
-                    .collect::<anyhow::Result<Vec<PageNumber>>>()?;
-
-                free
+                    .collect::<anyhow::Result<Vec<PageNumber>>>()?
             }
         };
 
@@ -135,7 +133,7 @@ impl FreeListTrunkPage {
 }
 
 fn vecu32_to_vecu8(v: &[u32]) -> Vec<u8> {
-    let capacity = (32 / 8) * v.len() as usize;
+    let capacity = (32 / 8) * v.len();
     let mut out = Vec::with_capacity(capacity);
 
     for value in v {

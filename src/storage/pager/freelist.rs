@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::file::{
+use crate::storage::{
     pager::Pager,
     pages::{trunk::FreeListTrunkPage, types::PageNumber},
 };
@@ -179,7 +179,7 @@ impl Pager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::pager::Pager;
+    use crate::storage::pager::Pager;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const PAGE_SIZE: usize = 512;

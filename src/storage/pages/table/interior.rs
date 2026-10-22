@@ -1,5 +1,5 @@
 /*
-    Interior b-tree page structure:
+    Interior table b-tree page structure:
 
     ┌───────────────────────────────────────────────┐
     │ type (1) | cell count (2) | content offset (2)│  header, 9 bytes in your format
@@ -15,12 +15,14 @@
     interior cell = u32 left_child (4 bytes, big-endian) | varint row_id
 */
 
-use crate::file::{
+use crate::storage::{
     pages::{
         Cell, PageNumber, PageType,
+        btree_page::{BTreePage, SplitKind, best_split},
         bytes::read_word_u32_be,
+        cell::InteriorCell,
         spec::PageSpec,
-        table::{SplitKind, TablePage, best_split},
+        types::RowID,
     },
     varint,
 };
@@ -39,7 +41,7 @@ impl TableInteriorPage {
         }
     }
 
-    pub fn child_of(&self, row_id: u64) -> PageNumber {
+    pub fn child_of(&self, row_id: RowID) -> PageNumber {
         let next_cell_idx = self.cells.partition_point(|cell| cell.row_id < row_id);
         match self.cells.get(next_cell_idx) {
             Some(cell) => cell.left_child,
@@ -64,7 +66,7 @@ impl TableInteriorPage {
     }
 }
 
-impl TablePage for TableInteriorPage {
+impl BTreePage for TableInteriorPage {
     type C = TableInteriorCell;
     type Key = <Self::C as Cell>::Key;
     const PAGE_TYPE: PageType = PageType::TableInterior;
@@ -74,7 +76,7 @@ impl TablePage for TableInteriorPage {
         rightmost_child: Option<PageNumber>,
     ) -> anyhow::Result<Self> {
         let rightmost_child = rightmost_child
-            .ok_or_else(|| anyhow::anyhow!("interior page has no rightmost child"))?;
+            .ok_or_else(|| anyhow::anyhow!("table interior page has no rightmost child"))?;
 
         Ok(Self {
             cells,
@@ -99,12 +101,12 @@ impl TablePage for TableInteriorPage {
         new_cell: TableInteriorCell,
         left: PageSpec,
         right: PageSpec,
-    ) -> anyhow::Result<(Self, Self, u64)> {
+    ) -> anyhow::Result<(Self, Self, RowID)> {
         self.insert_unchecked(new_cell)?;
 
         let s = best_split(
-            &self.cell_costs(),
-            SplitKind::TableInteriorSplit,
+            &self.cell_costs()?,
+            SplitKind::InteriorSplit,
             Self::PAGE_TYPE.header_size(),
             left.usable()?,
             right.usable()?,
@@ -128,50 +130,55 @@ pub struct TableInteriorCell {
     // Page number (essentially a pointer) to another TableInteriorPage or TableLeafPage
     pub left_child: PageNumber,
     // Varint encoded on disk.
-    pub row_id: u64,
+    pub row_id: RowID,
 }
 
 impl TableInteriorCell {
-    pub fn new(left_child: PageNumber, row_id: u64) -> Self {
+    pub fn new(left_child: PageNumber, row_id: RowID) -> Self {
         Self { left_child, row_id }
     }
 }
 
 impl Cell for TableInteriorCell {
-    type Key = u64;
+    type Key = RowID;
 
-    fn serialize(&self) -> Vec<u8> {
+    fn serialize(&self) -> anyhow::Result<Vec<u8>> {
         let mut bytes = self.left_child.get().to_be_bytes().to_vec();
-        bytes.extend_from_slice(&varint::encode(self.row_id));
+        bytes.extend_from_slice(&varint::encode(self.row_id.get()));
 
-        bytes
+        Ok(bytes)
     }
 
-    fn encoded_len(&self) -> usize {
-        std::mem::size_of::<u32>() + varint::encode(self.row_id).len()
+    fn encoded_len(&self) -> anyhow::Result<usize> {
+        Ok(std::mem::size_of::<u32>() + varint::encode(self.row_id.get()).len())
     }
 
-    fn sort_key(&self) -> u64 {
+    fn sort_key(&self) -> Self::Key {
         self.row_id
     }
 
     /// ps is only needed here for conformity with the trait unfortunately.
-    /// it's real purpose is only served when overflow support is implemented
-    /// for table leaf pages.
     fn parse(buf: &[u8], _ps: PageSpec) -> anyhow::Result<Self> {
         let left_child = PageNumber::try_from(read_word_u32_be(buf, 0)?)?;
         // &buf[4..] won't panic here because above line would've errored if buffer wasn't at least 4 bytes long
         let (row_id, _) =
             varint::decode(&buf[4..]).ok_or_else(|| anyhow::anyhow!("invalid row_id varint"))?;
+        let row_id = RowID::try_from(row_id)?;
 
         Ok(Self { left_child, row_id })
+    }
+}
+
+impl InteriorCell for TableInteriorCell {
+    fn left_child(&self) -> PageNumber {
+        self.left_child
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{header::MAZE_HEADER_SIZE, pages::Page};
+    use crate::storage::{header::MAZE_HEADER_SIZE, pages::Page};
 
     const PAGE_SIZE: usize = 512;
     const PAGE_SPEC: PageSpec = PageSpec {
@@ -183,9 +190,9 @@ mod tests {
         PageNumber::try_from(n).unwrap()
     }
 
-    fn interior_cell_bytes(left_child: u32, row_id: u64) -> Vec<u8> {
+    fn interior_cell_bytes(left_child: u32, row_id: RowID) -> Vec<u8> {
         let mut c = left_child.to_be_bytes().to_vec();
-        c.extend(varint::encode(row_id));
+        c.extend(varint::encode(row_id.get()));
         c
     }
 
@@ -200,7 +207,7 @@ mod tests {
         let region_len = PAGE_SIZE - base;
         let encoded: Vec<Vec<u8>> = cells
             .iter()
-            .map(|&(c, k)| interior_cell_bytes(c, k))
+            .map(|&(c, k)| interior_cell_bytes(c, RowID::try_from(k).unwrap()))
             .collect();
         let total: usize = encoded.iter().map(Vec::len).sum();
         let content_offset = region_len - total;
@@ -269,11 +276,11 @@ mod tests {
         let page = TableInteriorPage::parse(buf.as_slice(), PAGE_SPEC).unwrap();
         assert_eq!(page.cells.len(), 2);
         assert_eq!(
-            (page.cells[0].left_child, page.cells[0].row_id),
+            (page.cells[0].left_child, page.cells[0].row_id.get()),
             (pn(3), 10)
         );
         assert_eq!(
-            (page.cells[1].left_child, page.cells[1].row_id),
+            (page.cells[1].left_child, page.cells[1].row_id.get()),
             (pn(4), 20)
         );
     }
