@@ -207,7 +207,7 @@ impl TryFrom<u8> for PageType {
             5 => Ok(PageType::TableInterior),
             10 => Ok(PageType::IndexLeaf),
             2 => Ok(PageType::IndexInterior),
-            _ => anyhow::bail!("invalid page type"),
+            n => anyhow::bail!("invalid page type: value {n}"),
         }
     }
 }

@@ -1,19 +1,22 @@
-use crate::{btree::{DeleteOutcome, InsertOutcome}, storage::{
-    pager::Pager,
-    pages::{
-        Page,
-        btree_page::BTreePage,
-        spec::PageSpec,
-        table::{
-            interior::{TableInteriorCell, TableInteriorPage},
-            leaf::TableLeafCell,
+use crate::{
+    btree::{DeleteOutcome, InsertOutcome},
+    storage::{
+        pager::Pager,
+        pages::{
+            Page,
+            btree_page::BTreePage,
+            spec::PageSpec,
+            table::{
+                interior::{TableInteriorCell, TableInteriorPage},
+                leaf::{TableLeafCell, TableLeafPage},
+            },
+            types::{PageNumber, RowID},
         },
-        types::{PageNumber, RowID},
     },
-}};
+};
 
 pub struct TableCursor<'a> {
-    pager: &'a mut Pager,
+    pub pager: &'a mut Pager,
     root_pn: PageNumber,
 }
 
@@ -51,6 +54,24 @@ impl<'a> TableCursor<'a> {
                 )
             }
         }
+    }
+
+    /// deletes all pages of a table btree by freeing all its pages and overwriting the root.
+    pub fn delete_all(&mut self) -> anyhow::Result<()> {
+        self.delete_all_from(self.root_pn)?;
+
+        // overwrite root page with an empty leaf cell.
+        self.pager.write_page(
+            self.root_pn,
+            Page::TableLeaf(TableLeafPage::new(vec![])).serialize(self.pager.spec(self.root_pn))?,
+        )?;
+
+        Ok(())
+    }
+
+    /// fetches the current maximum row_id in the tree, if empty it returns page number 1.
+    pub fn get_max_row_id(&mut self) -> anyhow::Result<RowID> {
+        self.get_max_row_id_from(self.root_pn)
     }
 
     fn fetch_page(&mut self, page_number: PageNumber) -> anyhow::Result<Page> {
@@ -252,7 +273,6 @@ impl<'a> TableCursor<'a> {
                             self.pager.free_page(child)?;
                             return Ok(DeleteOutcome::DeletedChild);
                         }
-
                         ip.delete_child(child)?;
                         self.pager
                             .write_page(page_number, ip.serialize(self.pager.spec(page_number))?)?;
@@ -261,6 +281,54 @@ impl<'a> TableCursor<'a> {
                     }
                 }
             }
+            Page::IndexLeaf(_) | Page::IndexInterior(_) => {
+                anyhow::bail!(
+                    "fetched page {page_number}: expected a table page, found an index page"
+                )
+            }
+        }
+    }
+
+    fn delete_all_from(&mut self, page_number: PageNumber) -> anyhow::Result<()> {
+        match self.fetch_page(page_number)? {
+            Page::TableLeaf(lp) => {
+                for cell in lp.cells() {
+                    self.pager.free_overflow(cell.overflow_pn)?;
+                }
+                if page_number == self.root_pn {
+                    return Ok(());
+                }
+                self.pager.free_page(page_number)?;
+                Ok(())
+            }
+            Page::TableInterior(ip) => {
+                for cell in ip.cells() {
+                    self.delete_all_from(cell.left_child)?;
+                }
+                self.delete_all_from(ip.rightmost_child)?;
+                if page_number == self.root_pn {
+                    return Ok(());
+                }
+                self.pager.free_page(page_number)
+            }
+            Page::IndexLeaf(_) | Page::IndexInterior(_) => {
+                anyhow::bail!(
+                    "fetched page {page_number}: expected a table page, found an index page"
+                )
+            }
+        }
+    }
+
+    fn get_max_row_id_from(&mut self, page_number: PageNumber) -> anyhow::Result<RowID> {
+        match self.fetch_page(page_number)? {
+            Page::TableLeaf(lp) => {
+                if let Some(last) = lp.cells().last() {
+                    Ok(last.row_id)
+                } else {
+                    Ok(RowID::try_from(1).unwrap())
+                }
+            },
+            Page::TableInterior(ip) => self.get_max_row_id_from(ip.rightmost_child),
             Page::IndexLeaf(_) | Page::IndexInterior(_) => {
                 anyhow::bail!(
                     "fetched page {page_number}: expected a table page, found an index page"
@@ -286,7 +354,8 @@ impl<'a> TableCursor<'a> {
                 }
                 Page::IndexLeaf(_) | Page::IndexInterior(_) => {
                     anyhow::bail!(
-                        "fetched page {}: expected a table page, found an index page", self.root_pn
+                        "fetched page {}: expected a table page, found an index page",
+                        self.root_pn
                     )
                 }
             }

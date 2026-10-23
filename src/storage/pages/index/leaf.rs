@@ -16,6 +16,10 @@ pub struct IndexLeafPage {
 }
 
 impl IndexLeafPage {
+    pub fn new(cells: Vec<IndexLeafCell>) -> Self {
+        Self { cells }
+    }
+
     /// Mirrors `TableLeafPage::contains`.
     pub fn contains(&self, values: &[Value], row_id: RowID) -> bool {
         self.cells

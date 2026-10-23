@@ -69,7 +69,7 @@ impl Record {
     pub fn new(values: Vec<Value>) -> anyhow::Result<Self> {
         let column_codes = values
             .iter()
-            .map(|value| DataType::from(value).code())
+            .map(|value| DataType::from(value).encode())
             .collect::<anyhow::Result<Vec<u64>>>()?;
         Ok(Record {
             header: RecordHeader { column_codes },

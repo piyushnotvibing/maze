@@ -22,24 +22,17 @@
 use std::cmp::Ordering;
 
 use crate::{btree::{DeleteOutcome, InsertOutcome}, storage::{
-    pager::Pager,
-    pages::{
-        Page,
-        btree_page::BTreePage,
-        index::{
-            interior::{IndexInteriorCell, IndexInteriorPage},
-            leaf::IndexLeafCell,
-        },
-        spec::PageSpec,
-        types::{PageNumber, RowID},
-    },
-    record::values::Value,
+    pager::Pager, pages::{
+        Page, btree_page::BTreePage, index::{
+            interior::{IndexInteriorCell, IndexInteriorPage}, leaf::{IndexLeafCell, IndexLeafPage},
+        }, spec::PageSpec, types::{PageNumber, RowID},
+    }, record::values::Value,
 }};
 
 type Frame = (PageNumber, usize);
 
 pub struct IndexCursor<'a> {
-    pager: &'a mut Pager,
+    pub pager: &'a mut Pager,
     root_pn: PageNumber,
     unique: bool,
 }
@@ -105,6 +98,19 @@ impl<'a> IndexCursor<'a> {
                 )
             }
         }
+    }
+
+    /// deletes all pages of a table btree by freeing all its pages and overwriting the root.
+    pub fn delete_all(&mut self) -> anyhow::Result<()> {
+        self.delete_all_from(self.root_pn)?;
+
+        // overwrite root page with an empty leaf cell.
+        self.pager.write_page(
+            self.root_pn,
+            Page::IndexLeaf(IndexLeafPage::new(vec![])).serialize(self.pager.spec(self.root_pn))?,
+        )?;
+
+        Ok(())
     }
 
     fn fetch_page(&mut self, page_number: PageNumber) -> anyhow::Result<Page> {
@@ -278,6 +284,33 @@ impl<'a> IndexCursor<'a> {
                         Ok(DeleteOutcome::Done)
                     }
                 }
+            }
+            Page::TableLeaf(_) | Page::TableInterior(_) => {
+                anyhow::bail!(
+                    "fetched page {page_number}: expected an index page, found a table page"
+                )
+            }
+        }
+    }
+
+    fn delete_all_from(&mut self, page_number: PageNumber) -> anyhow::Result<()> {
+        match self.fetch_page(page_number)? {
+            Page::IndexLeaf(_) => {
+                if page_number == self.root_pn {
+                    return Ok(());
+                }
+                self.pager.free_page(page_number)?;
+                Ok(())
+            }
+            Page::IndexInterior(ip) => {
+                for cell in ip.cells() {
+                    self.delete_all_from(cell.left_child)?;
+                }
+                self.delete_all_from(ip.rightmost_child)?;
+                if page_number == self.root_pn {
+                    return Ok(());
+                }
+                self.pager.free_page(page_number)
             }
             Page::TableLeaf(_) | Page::TableInterior(_) => {
                 anyhow::bail!(

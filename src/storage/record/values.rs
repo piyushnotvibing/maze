@@ -72,7 +72,7 @@ impl PartialOrd for Value {
 
 impl Eq for Value {}
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DataType {
     Null,
     Int,
@@ -123,7 +123,7 @@ impl DataType {
         }
     }
 
-    pub fn code(&self) -> anyhow::Result<u64> {
+    pub fn encode(&self) -> anyhow::Result<u64> {
         match self {
             DataType::Null => Ok(0),
             DataType::Int => Ok(6),

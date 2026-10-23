@@ -364,29 +364,29 @@ reference implementation in the test (e.g. filtering a `Vec` directly).
 **Learning goal:** how a database tracks its own structure — the hinge
 between "storage engine" and "SQL layer."
 
-**What you'll build:** `src/catalog/mod.rs`, a `maze_master` system table.
+**What you'll build:** `src/catalog/mod.rs`, a `maze_schema` system table.
 
 **Checklist**
 
-- [ ] Design the `maze_master` row shape: `(type: "table"|"index", name,
+- [x] Design the `maze_schema` row shape: `(type: "table"|"index", name,
     table_name, root_page: u32, sql: String)` — `sql` stores the original
       `CREATE TABLE`/`CREATE INDEX` text (once Subproject 10 exists) or for
       now just a structured schema description.
-- [ ] Reserve page 1 (or whatever your root page convention is) as the
-      `maze_master` table's own root, created when `Pager::create` makes a
+- [x] Reserve page 1 (or whatever your root page convention is) as the
+      `maze_schema` table's own root, created when `Pager::create` makes a
       fresh database.
-- [ ] Implement `Catalog::load(&mut Pager) -> anyhow::Result<Catalog>`:
-      scan `maze_master` on open and build an in-memory map of table/index
+- [x] Implement `Catalog::load(&mut Pager) -> anyhow::Result<Catalog>`:
+      scan `maze_schema` on open and build an in-memory map of table/index
       name → (root page, column schema).
-- [ ] Implement `Catalog::create_table(&mut Pager, name, columns) ->
+- [x] Implement `Catalog::create_table(&mut Pager, name, columns) ->
     anyhow::Result<()>`: allocate a root page for the new table, insert
-      its row into `maze_master`, update the in-memory map.
-- [ ] Implement `Catalog::create_index(...)` similarly.
-- [ ] Implement basic validation helpers: does a table/index exist, does a
+      its row into `maze_schema`, update the in-memory map.
+- [x] Implement `Catalog::create_index(...)` similarly.
+- [x] Implement basic validation helpers: does a table/index exist, does a
       column exist on a table, what's its declared type — used by
       Subproject 11's planner/executor to validate statements before
       running them.
-- [ ] Test: create a database, define two tables and an index via the
+- [x] Test: create a database, define two tables and an index via the
       catalog API, close and reopen the file, reload the catalog, and
       assert the schema came back correctly and the tables' data (inserted
       before close) is still reachable via their root pages.
