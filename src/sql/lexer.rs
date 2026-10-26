@@ -1,3 +1,5 @@
+use crate::sql::ast::BinOp;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Create,
@@ -9,6 +11,8 @@ pub enum Token {
     Select,
     Update,
     Delete,
+    Primary,
+    Key,
     Unique,
     Star,
     Values,
@@ -38,7 +42,7 @@ pub enum Token {
     Eof,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Operation {
     Add, // +
     Sub, // -
@@ -52,15 +56,45 @@ pub enum Operation {
     Ne,   // != or <>
 }
 
+impl Operation {
+    pub fn is_comp_op(&self) -> bool {
+        match self {
+            Operation::Lt
+            | Operation::Lteq
+            | Operation::Gt
+            | Operation::Gteq
+            | Operation::Eq
+            | Operation::Ne => true,
+            _ => false,
+        }
+    }
+
+    pub fn to_bin_op(&self) -> BinOp {
+        match self {
+            // BinOp::Mul must be manually done.
+            Operation::Add => BinOp::Add,
+            Operation::Sub => BinOp::Sub,
+            Operation::Div => BinOp::Div,
+            Operation::Lt => BinOp::Lt,
+            Operation::Lteq => BinOp::Lteq,
+            Operation::Gt => BinOp::Gt,
+            Operation::Gteq => BinOp::Gteq,
+            Operation::Eq => BinOp::Eq,
+            Operation::Ne => BinOp::Ne,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Int(i64),
     Float(f64),
     String(String),
+    Blob(Vec<u8>),
     Null,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypeName {
     Integer,
     Real,
@@ -75,9 +109,11 @@ pub fn tokenize(sql: String) -> anyhow::Result<Vec<Token>> {
     let mut identity = String::new();
     let mut numeric_literal = String::new();
     let mut string_literal = String::new();
+    let mut blob_literal = String::new();
 
     let mut skip = false;
     let mut is_str_char = false;
+    let mut is_blob_char = false;
     while let Some(char) = characters.next() {
         if skip {
             skip = false;
@@ -85,52 +121,52 @@ pub fn tokenize(sql: String) -> anyhow::Result<Vec<Token>> {
         }
         let next = characters.peek();
         match char {
-            ' ' if is_str_char => string_literal.push(' '),
-            ' ' => push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?,
-            '+' if is_str_char => string_literal.push('+'),
-            '+' => {
+            ' ' if is_str_char && !is_blob_char => string_literal.push(' '),
+            ' ' if !is_blob_char => push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?,
+            '+' if is_str_char && !is_blob_char => string_literal.push('+'),
+            '+' if !is_blob_char => {
                 push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
                 tokens.push(Token::Operation(Operation::Add));
             }
-            '-' if is_str_char => string_literal.push('-'),
-            '-' => {
+            '-' if is_str_char && !is_blob_char => string_literal.push('-'),
+            '-' if !is_blob_char => {
                 push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
                 tokens.push(Token::Operation(Operation::Sub));
             }
-            '*' if is_str_char => string_literal.push('*'),
-            '*' => {
+            '*' if is_str_char && !is_blob_char => string_literal.push('*'),
+            '*' if !is_blob_char => {
                 push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
                 tokens.push(Token::Star);
             }
-            '/' if is_str_char => string_literal.push('/'),
-            '/' => {
+            '/' if is_str_char && !is_blob_char => string_literal.push('/'),
+            '/' if !is_blob_char => {
                 push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
                 tokens.push(Token::Operation(Operation::Div));
             }
 
-            '(' if is_str_char => string_literal.push('('),
-            '(' => {
+            '(' if is_str_char && !is_blob_char => string_literal.push('('),
+            '(' if !is_blob_char => {
                 push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
                 tokens.push(Token::LParen);
             }
-            ')' if is_str_char => string_literal.push(')'),
-            ')' => {
+            ')' if is_str_char && !is_blob_char => string_literal.push(')'),
+            ')' if !is_blob_char => {
                 push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
                 tokens.push(Token::RParen);
             }
-            ',' if is_str_char => string_literal.push(','),
-            ',' => {
+            ',' if is_str_char && !is_blob_char => string_literal.push(','),
+            ',' if !is_blob_char => {
                 push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
                 tokens.push(Token::Comma);
             }
-            ';' if is_str_char => string_literal.push(';'),
-            ';' => {
+            ';' if is_str_char && !is_blob_char => string_literal.push(';'),
+            ';' if !is_blob_char => {
                 push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
                 tokens.push(Token::Semicolon);
             }
 
-            '>' if is_str_char => string_literal.push('>'),
-            '>' => {
+            '>' if is_str_char && !is_blob_char => string_literal.push('>'),
+            '>' if !is_blob_char => {
                 push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
                 if let Some(&next_char) = next
                     && next_char == '='
@@ -142,12 +178,12 @@ pub fn tokenize(sql: String) -> anyhow::Result<Vec<Token>> {
                 }
             }
             '=' if is_str_char => string_literal.push('='),
-            '=' => {
+            '=' if !is_blob_char => {
                 push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
                 tokens.push(Token::Operation(Operation::Eq))
             }
-            '<' if is_str_char => string_literal.push('<'),
-            '<' => {
+            '<' if is_str_char && !is_blob_char => string_literal.push('<'),
+            '<' if !is_blob_char => {
                 push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
                 if let Some(&next_char) = next {
                     match next_char {
@@ -165,8 +201,8 @@ pub fn tokenize(sql: String) -> anyhow::Result<Vec<Token>> {
                     tokens.push(Token::Operation(Operation::Lt));
                 }
             }
-            '!' if is_str_char => string_literal.push('!'),
-            '!' => {
+            '!' if is_str_char && !is_blob_char => string_literal.push('!'),
+            '!' if !is_blob_char => {
                 if let Some(&next_char) = next
                     && next_char == '='
                 {
@@ -186,8 +222,15 @@ pub fn tokenize(sql: String) -> anyhow::Result<Vec<Token>> {
                     continue;
                 }
 
+                if is_blob_char && !blob_literal.is_empty() {
+                    tokens.push(Token::Literal(Literal::Blob(
+                        blob_literal.as_bytes().to_vec(),
+                    )));
+                    is_blob_char = false;
+                    blob_literal.clear();
+                }
                 // if string_literal is not empty, then this is the closing single quote
-                if !string_literal.is_empty() {
+                else if is_str_char && !string_literal.is_empty() {
                     tokens.push(Token::Literal(Literal::String(string_literal.clone())));
                     is_str_char = false;
                     string_literal.clear();
@@ -195,7 +238,22 @@ pub fn tokenize(sql: String) -> anyhow::Result<Vec<Token>> {
                     is_str_char = true;
                 }
             }
+            'X' if !is_str_char
+                && !is_blob_char
+                && (next.is_some_and(|&c| c == '\'') && blob_literal.is_empty()) =>
+            {
+                if let Some(&next_char) = next
+                    && next_char == '\''
+                {
+                    is_blob_char = true;
+                    skip = true;
+                }
+            }
             c => {
+                if is_blob_char {
+                    blob_literal.push(c);
+                    continue;
+                }
                 if is_str_char {
                     string_literal.push(c);
                     continue;
@@ -246,6 +304,8 @@ fn lookup_sql_keyword(literal: &str) -> Option<Token> {
         "select" | "SELECT" => Some(Token::Select),
         "update" | "UPDATE" => Some(Token::Update),
         "delete" | "DELETE" => Some(Token::Delete),
+        "primary" | "PRIMARY" => Some(Token::Primary),
+        "key" | "KEY" => Some(Token::Key),
         "unique" | "UNIQUE" => Some(Token::Unique),
         "*" => Some(Token::Star),
         "values" | "VALUES" => Some(Token::Values),
@@ -266,6 +326,8 @@ fn lookup_sql_keyword(literal: &str) -> Option<Token> {
         "REAL" => Some(Token::DataType(TypeName::Real)),
         "TEXT" => Some(Token::DataType(TypeName::Text)),
         "BLOB" => Some(Token::DataType(TypeName::Blob)),
+
+        "null" | "NULL" => Some(Token::Literal(Literal::Null)),
         _ => None,
     }
 }
@@ -299,7 +361,12 @@ fn parse_and_push_f64(numeric_literal: &str, tokens: &mut Vec<Token>) -> anyhow:
     }
     if !numeric_literal.is_empty() {
         match numeric_literal.parse::<f64>() {
-            Ok(f) => tokens.push(Token::Literal(Literal::Float(f))),
+            Ok(f) => {
+                if f.is_subnormal() || f.is_nan() || f.is_infinite() {
+                    anyhow::bail!("lexer error: parsed real number {f} is NaN, infinite or invalid")
+                }
+                tokens.push(Token::Literal(Literal::Float(f)))
+            }
             Err(e) => anyhow::bail!("lexer error: failed to parse {numeric_literal} as f64: {e}"),
         }
     }

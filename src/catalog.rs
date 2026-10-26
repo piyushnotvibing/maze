@@ -16,10 +16,16 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    btree::{index_cursor::IndexCursor, table_cursor::TableCursor}, storage::{
-        pager::Pager, pages::{
-            btree_page::BTreePage, index::leaf::IndexLeafPage, table::leaf::TableLeafPage, types::{PageNumber, RowID},
-        }, record::{
+    btree::{index_cursor::IndexCursor, table_cursor::TableCursor},
+    storage::{
+        pager::Pager,
+        pages::{
+            btree_page::BTreePage,
+            index::leaf::IndexLeafPage,
+            table::leaf::TableLeafPage,
+            types::{PageNumber, RowID},
+        },
+        record::{
             Record,
             values::{DataType, Value},
         },
@@ -37,6 +43,15 @@ pub struct TableInfo {
     pub columns: Vec<Column>,
 }
 
+// this whole column struct is gonna go and
+// be replaced by sql column in maze_schema
+// i'll write a function in the sql module
+// that will take a CREATE TABLE/INDEX
+// string and return the columns in it.
+// So we simply store the SQL string, then 
+// create_table() & create_index() will call
+// that function get_columns() or something
+// to get the columns out of the sql string.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Column {
     pub name: String,
@@ -44,7 +59,7 @@ pub struct Column {
 }
 
 impl Column {
-    pub fn to_values(&self) -> anyhow::Result<Vec<Value>> {
+    fn to_values(&self) -> anyhow::Result<Vec<Value>> {
         Ok(vec![
             Value::Text(self.name.to_owned()),
             Value::Int(self.c_type.encode()? as i64),
@@ -141,8 +156,7 @@ impl Catalog {
         unique: bool,
         pager: &mut Pager,
     ) -> anyhow::Result<()> {
-        if self.indexes.contains_key(new_index_name)
-        {
+        if self.indexes.contains_key(new_index_name) {
             anyhow::bail!("index {new_index_name} already exists on table {on_table}")
         }
         if !self.tables.contains_key(on_table) {
@@ -666,7 +680,9 @@ mod tests {
             name: "id".to_string(),
             c_type: DataType::Int,
         }];
-        catalog.create_table("users", cols.clone(), &mut pager).unwrap();
+        catalog
+            .create_table("users", cols.clone(), &mut pager)
+            .unwrap();
 
         assert!(catalog.create_table("users", cols, &mut pager).is_err());
     }
@@ -850,7 +866,13 @@ mod tests {
         };
         assert!(
             catalog
-                .create_index("idx_bad", "users", vec![not_a_real_column], false, &mut pager)
+                .create_index(
+                    "idx_bad",
+                    "users",
+                    vec![not_a_real_column],
+                    false,
+                    &mut pager
+                )
                 .is_err()
         );
     }

@@ -1,5 +1,8 @@
+use crate::sql::lexer::TypeName;
+
 pub mod lexer;
 pub mod ast;
+pub mod parser;
 
 /*
     Statements that I will support:
@@ -43,7 +46,7 @@ pub mod ast;
 
     <arith_expr>      ::= <term> { ( "+" | "-" ) <term> }
     <term>            ::= <factor> { ( "*" | "/" ) <factor> }
-    <factor>          ::= [ "+" | "-" ] <primary>
+    <factor>          ::= [ "-" ] <primary>
     <primary>         ::= <ident> | <literal> | "(" <expr> ")"
 
     <literal>         ::= <int_literal> | <float_literal> | <string_literal> | "NULL"
@@ -52,4 +55,17 @@ pub mod ast;
         "parse one and_expr, then loop consuming OR and_expr as long as the next token is OR."
     -> [ X ] becomes if <lookahead matches X's start> { ... } — an optional clause you either consume or skip.
     -> A | B becomes a match/if on the current token
+
+    if you notice, NULL is a literal here, and it could end up in an arithmetic expression
+    something like SELECT * FROM employee WHERE salary = 30000 + NULL; will parse, and it should evaluate like
+        => salary = 30000 + NULL
+        => salary = NULL
+        => UNKNOWN
+    the WHERE filter evaluates to UNKNOWN, which returns 0 rows. 
 */
+
+#[derive(Eq, PartialEq, Hash)]
+pub struct Column {
+    name: String,
+    c_type: Option<TypeName>,
+}

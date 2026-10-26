@@ -1,7 +1,7 @@
 use maze::sql::lexer::tokenize;
 
 fn main() {
-    match tokenize("SELECT name AS unc FROM employees WHERE age >= 30.6 AND name = 'Piyush Udhao''s Dog' ORDER BY name LIMIT 10;".to_string()) {
+    match tokenize("INSERT INTO employee VALUES (1, 'PETER PARKER', 25, 261.23, X'JDCNAKNSC8328473829JDKSD');".to_string()) {
         Ok(v) => println!("{v:?}"),
         Err(e) => panic!("{e}"),
     }
