@@ -64,7 +64,7 @@ pub mod parser;
     the WHERE filter evaluates to UNKNOWN, which returns 0 rows. 
 */
 
-#[derive(Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Column {
     name: String,
     c_type: Option<TypeName>,

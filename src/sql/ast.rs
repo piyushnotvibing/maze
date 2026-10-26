@@ -5,6 +5,7 @@ use crate::{
     storage::record::values::Value,
 };
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     CreateTable {
         table: String,
@@ -57,7 +58,7 @@ pub enum Stmt {
     },
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Ident(String),
     Literal(Literal),
@@ -65,7 +66,7 @@ pub enum Expr {
     Binary(Box<Expr>, BinOp, Box<Expr>),
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Or,
     And,
@@ -81,17 +82,19 @@ pub enum BinOp {
     Div,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Neg,
     Not,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortDir {
     Asc,
     Desc,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct Assignment {
     pub column: Column,
     pub value: Expr,

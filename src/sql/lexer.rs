@@ -698,4 +698,103 @@ mod tests {
     fn rejects_a_number_with_two_decimal_points() {
         assert!(tok("SELECT 1.2.3 FROM t").is_err());
     }
+
+    // ---- additional edge cases found while verifying the bug report ----
+
+    #[test]
+    fn empty_string_literal_emits_an_empty_string_token() {
+        assert_eq!(
+            tok("''").unwrap(),
+            vec![Token::Literal(Literal::String(String::new())), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn empty_string_literal_in_context_does_not_corrupt_surrounding_tokens() {
+        assert_eq!(
+            tok("SELECT '' FROM t;").unwrap(),
+            vec![
+                Token::Select,
+                Token::Literal(Literal::String(String::new())),
+                Token::From,
+                Token::Id("t".to_string()),
+                Token::Semicolon,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_blob_literal_emits_an_empty_blob_token() {
+        assert_eq!(
+            tok("X''").unwrap(),
+            vec![Token::Literal(Literal::Blob(Vec::new())), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn blob_literal_with_content() {
+        assert_eq!(
+            tok("X'hello'").unwrap(),
+            vec![
+                Token::Literal(Literal::Blob(b"hello".to_vec())),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_an_unterminated_blob_literal() {
+        assert!(tok("X'abc").is_err());
+    }
+
+    #[test]
+    fn equals_sign_inside_a_blob_literal_is_preserved() {
+        assert_eq!(
+            tok("X'a=b'").unwrap(),
+            vec![Token::Literal(Literal::Blob(b"a=b".to_vec())), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn mixed_case_keyword_is_recognized() {
+        assert_eq!(tok("Select").unwrap(), vec![Token::Select, Token::Eof]);
+    }
+
+    #[test]
+    fn lowercase_type_name_is_recognized() {
+        assert_eq!(
+            tok("integer").unwrap(),
+            vec![Token::DataType(TypeName::Integer), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn primary_and_key_tokens_are_recognized() {
+        assert_eq!(
+            tok("PRIMARY KEY").unwrap(),
+            vec![Token::Primary, Token::Key, Token::Eof]
+        );
+    }
+
+    #[test]
+    fn null_literal_is_recognized() {
+        assert_eq!(
+            tok("NULL").unwrap(),
+            vec![Token::Literal(Literal::Null), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn x_inside_an_ordinary_identifier_is_not_mistaken_for_a_blob_prefix() {
+        assert_eq!(
+            tok("TEXT INDEX MAX").unwrap(),
+            vec![
+                Token::DataType(TypeName::Text),
+                Token::Index,
+                Token::Id("MAX".to_string()),
+                Token::Eof,
+            ]
+        );
+    }
 }

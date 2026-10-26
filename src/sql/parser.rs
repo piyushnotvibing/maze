@@ -818,3 +818,603 @@ fn is_comp_op(token: &Token) -> bool {
         || *token == Token::Operation(Operation::Eq)
         || *token == Token::Operation(Operation::Ne)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::lexer::tokenize;
+
+    fn parse_sql(sql: &str) -> anyhow::Result<Vec<Stmt>> {
+        parse(tokenize(sql.to_string())?)
+    }
+
+    fn parse_expr_fragment(fragment: &str) -> anyhow::Result<Expr> {
+        let tokens = tokenize(fragment.to_string())?;
+        Parser::new(tokens).parse_expr()
+    }
+
+    fn col(name: &str, c_type: Option<TypeName>) -> Column {
+        Column {
+            name: name.to_string(),
+            c_type,
+        }
+    }
+
+    fn select_cols(pairs: &[(&str, &str)]) -> HashMap<Column, Column> {
+        pairs
+            .iter()
+            .map(|(name, alias)| (col(name, None), col(alias, None)))
+            .collect()
+    }
+
+    fn star_cols() -> HashMap<Column, Column> {
+        let mut m = HashMap::new();
+        m.insert(col("*", None), col("*", None));
+        m
+    }
+
+    fn ident(s: &str) -> Expr {
+        Expr::Ident(s.to_string())
+    }
+
+    fn int(i: i64) -> Expr {
+        Expr::Literal(Literal::Int(i))
+    }
+
+    fn bin(l: Expr, op: BinOp, r: Expr) -> Expr {
+        Expr::Binary(Box::new(l), op, Box::new(r))
+    }
+
+    // ---- CREATE TABLE ----
+
+    #[test]
+    fn create_table_single_column() {
+        let stmts = parse_sql("CREATE TABLE t (id INTEGER);").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::CreateTable {
+                table: "t".to_string(),
+                columns: vec![col("id", Some(TypeName::Integer))],
+            }]
+        );
+    }
+
+    #[test]
+    fn create_table_multiple_typed_columns() {
+        let stmts =
+            parse_sql("CREATE TABLE employees (id INTEGER, name TEXT, salary REAL, photo BLOB);")
+                .unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::CreateTable {
+                table: "employees".to_string(),
+                columns: vec![
+                    col("id", Some(TypeName::Integer)),
+                    col("name", Some(TypeName::Text)),
+                    col("salary", Some(TypeName::Real)),
+                    col("photo", Some(TypeName::Blob)),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn create_table_rejects_missing_table_name() {
+        assert!(parse_sql("CREATE TABLE (id INTEGER);").is_err());
+    }
+
+    #[test]
+    fn create_table_rejects_a_column_with_no_type() {
+        assert!(parse_sql("CREATE TABLE t (id);").is_err());
+    }
+
+    #[test]
+    fn create_table_rejects_an_empty_column_list() {
+        assert!(parse_sql("CREATE TABLE t ();").is_err());
+    }
+
+    #[test]
+    fn create_table_rejects_a_missing_closing_paren() {
+        assert!(parse_sql("CREATE TABLE t (id INTEGER;").is_err());
+    }
+
+    // ---- CREATE INDEX ----
+
+    #[test]
+    fn create_plain_index() {
+        let stmts = parse_sql("CREATE INDEX idx ON employees (salary);").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::CreateIndex {
+                index: "idx".to_string(),
+                table: "employees".to_string(),
+                on_columns: vec![col("salary", None)],
+                unique: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn create_unique_index() {
+        let stmts = parse_sql("CREATE UNIQUE INDEX idx ON employees (salary);").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::CreateIndex {
+                index: "idx".to_string(),
+                table: "employees".to_string(),
+                on_columns: vec![col("salary", None)],
+                unique: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn create_index_on_multiple_columns() {
+        let stmts = parse_sql("CREATE INDEX idx ON t (a, b, c);").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::CreateIndex {
+                index: "idx".to_string(),
+                table: "t".to_string(),
+                on_columns: vec![col("a", None), col("b", None), col("c", None)],
+                unique: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn create_index_rejects_a_missing_on() {
+        assert!(parse_sql("CREATE INDEX idx employees (salary);").is_err());
+    }
+
+    // ---- INSERT ----
+
+    #[test]
+    fn insert_with_explicit_column_list() {
+        let stmts = parse_sql("INSERT INTO employees (id, name) VALUES (1, 'Ada');").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Insert {
+                table: "employees".to_string(),
+                into_columns: Some(vec![col("id", None), col("name", None)]),
+                values: vec![Value::Int(1), Value::Text("Ada".to_string())],
+            }]
+        );
+    }
+
+    #[test]
+    fn insert_without_column_list() {
+        let stmts = parse_sql("INSERT INTO employees VALUES (1, 'Ada');").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Insert {
+                table: "employees".to_string(),
+                into_columns: None,
+                values: vec![Value::Int(1), Value::Text("Ada".to_string())],
+            }]
+        );
+    }
+
+    #[test]
+    fn insert_accepts_mixed_literal_types_including_null() {
+        let stmts =
+            parse_sql("INSERT INTO t VALUES (1, 2.5, 'hi', NULL);").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Insert {
+                table: "t".to_string(),
+                into_columns: None,
+                values: vec![
+                    Value::Int(1),
+                    Value::Float(2.5),
+                    Value::Text("hi".to_string()),
+                    Value::Null,
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn insert_accepts_a_negative_literal_value() {
+        let stmts = parse_sql("INSERT INTO t VALUES (-1);").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Insert {
+                table: "t".to_string(),
+                into_columns: None,
+                values: vec![Value::Int(-1)],
+            }]
+        );
+    }
+
+    #[test]
+    fn insert_rejects_arity_mismatch_between_columns_and_values() {
+        assert!(parse_sql("INSERT INTO t (id, name) VALUES (1);").is_err());
+    }
+
+    #[test]
+    fn insert_rejects_a_missing_values_keyword() {
+        assert!(parse_sql("INSERT INTO t (id) (1);").is_err());
+    }
+
+    // ---- SELECT ----
+
+    #[test]
+    fn select_star() {
+        let stmts = parse_sql("SELECT * FROM employees;").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Select {
+                table: "employees".to_string(),
+                select_columns: star_cols(),
+                where_clause: None,
+                order_by: None,
+                limit: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn select_specific_columns() {
+        let stmts = parse_sql("SELECT id, name FROM employees;").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Select {
+                table: "employees".to_string(),
+                select_columns: select_cols(&[("id", "id"), ("name", "name")]),
+                where_clause: None,
+                order_by: None,
+                limit: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn select_with_alias() {
+        let stmts = parse_sql("SELECT name AS unc FROM employees;").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Select {
+                table: "employees".to_string(),
+                select_columns: select_cols(&[("name", "unc")]),
+                where_clause: None,
+                order_by: None,
+                limit: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn select_rejects_a_wildcard_combined_with_named_columns() {
+        assert!(parse_sql("SELECT *, name FROM employees;").is_err());
+    }
+
+    #[test]
+    fn select_rejects_a_missing_from() {
+        assert!(parse_sql("SELECT id;").is_err());
+    }
+
+    #[test]
+    fn select_with_simple_where() {
+        let stmts = parse_sql("SELECT id FROM employees WHERE id = 1;").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Select {
+                table: "employees".to_string(),
+                select_columns: select_cols(&[("id", "id")]),
+                where_clause: Some(bin(ident("id"), BinOp::Eq, int(1))),
+                order_by: None,
+                limit: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn select_with_where_not() {
+        let stmts = parse_sql("SELECT id FROM employees WHERE NOT id = 1;").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Select {
+                table: "employees".to_string(),
+                select_columns: select_cols(&[("id", "id")]),
+                where_clause: Some(Expr::Unary(
+                    UnaryOp::Not,
+                    Box::new(bin(ident("id"), BinOp::Eq, int(1)))
+                )),
+                order_by: None,
+                limit: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn select_with_where_and() {
+        let stmts = parse_sql("SELECT id FROM employees WHERE id = 1 AND age = 2;").unwrap();
+        let Stmt::Select { where_clause, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(
+            *where_clause,
+            Some(bin(
+                bin(ident("id"), BinOp::Eq, int(1)),
+                BinOp::And,
+                bin(ident("age"), BinOp::Eq, int(2)),
+            ))
+        );
+    }
+
+    #[test]
+    fn select_with_where_and_binds_tighter_than_or() {
+        // a = 1 OR b = 2 AND c = 3  ==  a = 1 OR (b = 2 AND c = 3)
+        let stmts =
+            parse_sql("SELECT id FROM t WHERE a = 1 OR b = 2 AND c = 3;").unwrap();
+        let Stmt::Select { where_clause, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(
+            *where_clause,
+            Some(bin(
+                bin(ident("a"), BinOp::Eq, int(1)),
+                BinOp::Or,
+                bin(
+                    bin(ident("b"), BinOp::Eq, int(2)),
+                    BinOp::And,
+                    bin(ident("c"), BinOp::Eq, int(3)),
+                ),
+            ))
+        );
+    }
+
+    #[test]
+    fn select_with_parenthesized_where() {
+        let stmts = parse_sql("SELECT id FROM t WHERE (id = 1);").unwrap();
+        let Stmt::Select { where_clause, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(*where_clause, Some(bin(ident("id"), BinOp::Eq, int(1))));
+    }
+
+    #[test]
+    fn select_where_accepts_a_bare_expression_with_no_comparison() {
+        // WHERE flag  (no comparison operator at all; grammar makes it optional)
+        let stmts = parse_sql("SELECT id FROM t WHERE flag;").unwrap();
+        let Stmt::Select { where_clause, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(*where_clause, Some(ident("flag")));
+    }
+
+    #[test]
+    fn select_where_rejects_a_chained_comparison() {
+        // a = b = c is not defined by the grammar.
+        assert!(parse_sql("SELECT id FROM t WHERE a = b = c;").is_err());
+    }
+
+    #[test]
+    fn select_with_arithmetic_projection() {
+        // `select_columns: HashMap<Column, Column>` has no way to hold an
+        // expression, only a bare name — this can't actually succeed until
+        // that type is restructured to hold `Expr`s (see bug report), so for
+        // now this documents the current, honest failure rather than a
+        // fictional AST shape.
+        assert!(parse_sql("SELECT salary + bonus FROM employees;").is_err());
+    }
+
+    #[test]
+    fn select_with_order_by_defaults_to_ascending_when_direction_omitted() {
+        let stmts = parse_sql("SELECT id FROM t ORDER BY id;").unwrap();
+        let Stmt::Select { order_by, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(*order_by, Some((ident("id"), SortDir::Asc)));
+    }
+
+    #[test]
+    fn select_with_order_by_desc() {
+        let stmts = parse_sql("SELECT id FROM t ORDER BY id DESC;").unwrap();
+        let Stmt::Select { order_by, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(*order_by, Some((ident("id"), SortDir::Desc)));
+    }
+
+    #[test]
+    fn select_with_limit() {
+        let stmts = parse_sql("SELECT id FROM t LIMIT 10;").unwrap();
+        let Stmt::Select { limit, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(*limit, Some(10));
+    }
+
+    #[test]
+    fn select_rejects_a_non_integer_limit() {
+        assert!(parse_sql("SELECT id FROM t LIMIT 'x';").is_err());
+    }
+
+    #[test]
+    fn select_rejects_a_negative_limit() {
+        assert!(parse_sql("SELECT id FROM t LIMIT -1;").is_err());
+    }
+
+    #[test]
+    fn select_with_where_order_by_and_limit_together() {
+        let stmts =
+            parse_sql("SELECT id FROM t WHERE id = 1 ORDER BY id DESC LIMIT 5;").unwrap();
+        let Stmt::Select {
+            where_clause,
+            order_by,
+            limit,
+            ..
+        } = &stmts[0]
+        else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(*where_clause, Some(bin(ident("id"), BinOp::Eq, int(1))));
+        assert_eq!(*order_by, Some((ident("id"), SortDir::Desc)));
+        assert_eq!(*limit, Some(5));
+    }
+
+    #[test]
+    fn select_order_by_rejects_a_non_identifier_column() {
+        assert!(parse_sql("SELECT id FROM t ORDER BY 5;").is_err());
+    }
+
+    // ---- UPDATE ----
+
+    #[test]
+    fn update_single_assignment_with_where() {
+        let stmts = parse_sql("UPDATE employees SET name = 'Bob' WHERE id = 1;").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Update {
+                table: "employees".to_string(),
+                set: vec![Assignment {
+                    column: col("name", None),
+                    value: Expr::Literal(Literal::String("Bob".to_string())),
+                }],
+                where_clause: Some(bin(ident("id"), BinOp::Eq, int(1))),
+            }]
+        );
+    }
+
+    #[test]
+    fn update_multiple_assignments() {
+        let stmts =
+            parse_sql("UPDATE employees SET name = 'Bob', age = 30 WHERE id = 1;").unwrap();
+        let Stmt::Update { set, .. } = &stmts[0] else {
+            panic!("expected an Update statement");
+        };
+        assert_eq!(
+            *set,
+            vec![
+                Assignment {
+                    column: col("name", None),
+                    value: Expr::Literal(Literal::String("Bob".to_string())),
+                },
+                Assignment {
+                    column: col("age", None),
+                    value: int(30),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn update_without_where() {
+        let stmts = parse_sql("UPDATE employees SET name = 'Bob';").unwrap();
+        let Stmt::Update { where_clause, .. } = &stmts[0] else {
+            panic!("expected an Update statement");
+        };
+        assert_eq!(*where_clause, None);
+    }
+
+    // ---- DELETE ----
+
+    #[test]
+    fn delete_with_where() {
+        let stmts = parse_sql("DELETE FROM employees WHERE id = 1;").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Delete {
+                table: "employees".to_string(),
+                where_clause: Some(bin(ident("id"), BinOp::Eq, int(1))),
+            }]
+        );
+    }
+
+    #[test]
+    fn delete_without_where() {
+        let stmts = parse_sql("DELETE FROM employees;").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Delete {
+                table: "employees".to_string(),
+                where_clause: None,
+            }]
+        );
+    }
+
+    // ---- multiple statements ----
+
+    #[test]
+    fn multiple_semicolon_separated_statements_all_parse() {
+        let stmts = parse_sql("SELECT id FROM t; DELETE FROM t WHERE id = 1;").unwrap();
+        assert_eq!(stmts.len(), 2);
+    }
+
+    // ---- expression precedence and associativity (isolated, via parse_expr) ----
+
+    #[test]
+    fn multiplication_binds_tighter_than_addition() {
+        // a + b * c == a + (b * c)
+        let expr = parse_expr_fragment("a + b * c").unwrap();
+        assert_eq!(
+            expr,
+            bin(ident("a"), BinOp::Add, bin(ident("b"), BinOp::Mul, ident("c")))
+        );
+    }
+
+    #[test]
+    fn subtraction_is_left_associative() {
+        // a - b - c == (a - b) - c
+        let expr = parse_expr_fragment("a - b - c").unwrap();
+        assert_eq!(
+            expr,
+            bin(bin(ident("a"), BinOp::Sub, ident("b")), BinOp::Sub, ident("c"))
+        );
+    }
+
+    #[test]
+    fn parens_override_default_precedence() {
+        // (a + b) * c
+        let expr = parse_expr_fragment("(a + b) * c").unwrap();
+        assert_eq!(
+            expr,
+            bin(bin(ident("a"), BinOp::Add, ident("b")), BinOp::Mul, ident("c"))
+        );
+    }
+
+    #[test]
+    fn unary_negation_binds_before_addition() {
+        // -a + b == (-a) + b
+        let expr = parse_expr_fragment("-a + b").unwrap();
+        assert_eq!(
+            expr,
+            bin(
+                Expr::Unary(UnaryOp::Neg, Box::new(ident("a"))),
+                BinOp::Add,
+                ident("b")
+            )
+        );
+    }
+
+    #[test]
+    fn full_arithmetic_precedence_chain() {
+        // a + b / c - d * e  ==  (a + (b / c)) - (d * e)
+        let expr = parse_expr_fragment("a + b / c - d * e").unwrap();
+        assert_eq!(
+            expr,
+            bin(
+                bin(ident("a"), BinOp::Add, bin(ident("b"), BinOp::Div, ident("c"))),
+                BinOp::Sub,
+                bin(ident("d"), BinOp::Mul, ident("e")),
+            )
+        );
+    }
+
+    #[test]
+    fn not_wraps_the_comparison_it_precedes() {
+        let expr = parse_expr_fragment("NOT a = 1").unwrap();
+        assert_eq!(
+            expr,
+            Expr::Unary(UnaryOp::Not, Box::new(bin(ident("a"), BinOp::Eq, int(1))))
+        );
+    }
+
+    #[test]
+    fn a_single_identifier_is_a_valid_expression_on_its_own() {
+        let expr = parse_expr_fragment("a").unwrap();
+        assert_eq!(expr, ident("a"));
+    }
+}
