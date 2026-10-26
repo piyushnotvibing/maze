@@ -4,3 +4,4 @@
 pub mod btree;
 pub mod storage;
 pub mod catalog;
+pub mod sql;
