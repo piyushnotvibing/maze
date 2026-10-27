@@ -1,5 +1,3 @@
-use crate::sql::lexer::TypeName;
-
 pub mod lexer;
 pub mod ast;
 pub mod parser;
@@ -27,7 +25,7 @@ pub mod parser;
     <insert>          ::= "INSERT" "INTO" <ident> [ "(" <ident> { "," <ident> } ")" ] "VALUES" "(" <literal> { "," <literal> } ")"
 
     <select>          ::= "SELECT" <select_list> "FROM" <ident> [ <where_clause> ] [ <order_by_clause> ] [ <limit_clause> ]
-    <select_list>     ::= "*" | <ident> [ "AS" <ident> ] { "," <ident> [ "AS" <ident> ] }
+    <select_list>     ::= "*" | <ident> [ "AS" <ident> ] { "," <ident> [ "AS" <ident> ] } | <expr>
     <where_clause>    ::= "WHERE" <expr>
     <order_by_clause> ::= "ORDER" "BY" <ident> [ "ASC" | "DESC" ]
     <limit_clause>    ::= "LIMIT" <int_literal>
@@ -67,21 +65,4 @@ pub mod parser;
         -> col <type> UNIQUE NOT NULL
         -> col <type> NOT NULL UNIQUE
         -> col <type> PRIMARY KEY
-*/
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub struct Column {
-    pub name: String,
-    pub alias: Option<String>,
-    pub c_type: Option<TypeName>,
-    pub constraints: ColumnConstraints,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub enum ColumnConstraints {
-    None,
-    PrimaryKey,
-    Unique,
-    NotNull,
-    UniqueNotNull
-} 
+*/ 

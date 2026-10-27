@@ -406,23 +406,23 @@ text yet.
 
 **Checklist**
 
-- [ ] Define a `Token` enum: keywords (`CREATE`, `TABLE`, `INDEX`, `INSERT`,
+- [x] Define a `Token` enum: keywords (`CREATE`, `TABLE`, `INDEX`, `INSERT`,
       `INTO`, `VALUES`, `SELECT`, `FROM`, `WHERE`, `ORDER`, `BY`, `LIMIT`,
       `UPDATE`, `SET`, `DELETE`, `AND`, `OR`, `NULL`, type names, etc.),
       identifiers, literals (int/float/string), punctuation
       (`,`, `(`, `)`, `;`, operators), and EOF.
-- [ ] Implement `Lexer::next_token` by hand (no regex crate — manual
+- [x] Implement `Lexer::next_token` by hand (no regex crate — manual
       character scanning), handling whitespace/comments, quoted
       identifiers/strings, and number literals.
-- [ ] Define the AST (`ast.rs`): `Stmt::CreateTable`, `Stmt::CreateIndex`,
+- [x] Define the AST (`ast.rs`): `Stmt::CreateTable`, `Stmt::CreateIndex`,
       `Stmt::Insert`, `Stmt::Select`, `Stmt::Update`, `Stmt::Delete`, plus
       `Expr` for `WHERE`/`SET` expressions (column refs, literals,
       comparisons, `AND`/`OR`).
-- [ ] Implement the recursive-descent parser for each statement kind, one
+- [x] Implement the recursive-descent parser for each statement kind, one
       at a time, in roughly this order: `CREATE TABLE` → `INSERT` →
       `SELECT` (no `WHERE` yet) → `WHERE` expressions → `ORDER BY`/`LIMIT`
       → `UPDATE`/`DELETE` → `CREATE INDEX`.
-- [ ] Unit test each grammar rule in isolation, plus a handful of
+- [x] Unit test each grammar rule in isolation, plus a handful of
       deliberately invalid inputs per statement kind asserting a parse
       error (not a panic).
 

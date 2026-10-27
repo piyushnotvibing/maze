@@ -1,5 +1,5 @@
 use crate::{
-    sql::{Column, lexer::Literal},
+    sql::lexer::{Literal, TypeName},
     storage::record::values::Value,
 };
 
@@ -7,12 +7,12 @@ use crate::{
 pub enum Stmt {
     CreateTable {
         table: String,
-        columns: Vec<Column>,
+        columns: Vec<CreateTableColumn>,
     },
     CreateIndex {
         index: String,
         table: String,
-        on_columns: Vec<Column>,
+        on_columns: Vec<CreateIndexColumn>,
         unique: bool,
     },
 
@@ -25,7 +25,7 @@ pub enum Stmt {
     */
     Insert {
         table: String,
-        into_columns: Option<Vec<Column>>,
+        into_columns: Option<Vec<InsertColumn>>,
         values: Vec<Value>,
     },
 
@@ -33,7 +33,7 @@ pub enum Stmt {
         table: String,
         // SELECT name as EMP_NAME, age FROM ... is stored as Some({{name: EMP_NAME}, {age: age}})
         // If SELECT * FROM..., then Some({{"*": "*"}})
-        select_columns: Vec<Column>,
+        select_columns: Vec<SelectColumn>,
         where_clause: Option<Expr>,
         order_by: Option<(Expr, SortDir)>,
         limit: Option<u64>,
@@ -59,6 +59,28 @@ pub enum Expr {
     Binary(Box<Expr>, BinOp, Box<Expr>),
 }
 
+impl Expr {
+    pub fn try_to_string(&self) -> anyhow::Result<String> {
+        match self {
+            Expr::Ident(id) => Ok(id.clone()),
+            Expr::Literal(l) => match l {
+                Literal::Int(i) => Ok(i.to_string()),
+                Literal::Float(f) => Ok(f.to_string()),
+                Literal::String(s) => Ok(s.clone()),
+                Literal::Blob(items) => Ok(String::from_utf8_lossy(items).into_owned()),
+                Literal::Null => Ok(String::from("NULL")),
+            },
+            Expr::Unary(op, expr) => Ok(format!("{} {}", op.to_string(), expr.try_to_string()?)),
+            Expr::Binary(expr1, bin_op, expr2) => Ok(format!(
+                "{} {} {}",
+                expr1.try_to_string()?,
+                bin_op.to_string(),
+                expr2.try_to_string()?
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Or,
@@ -75,10 +97,38 @@ pub enum BinOp {
     Div,
 }
 
+impl ToString for BinOp {
+    fn to_string(&self) -> String {
+        match self {
+            BinOp::Or => "OR".to_string(),
+            BinOp::And => "AND".to_string(),
+            BinOp::Eq => "=".to_string(),
+            BinOp::Ne => "<>".to_string(),
+            BinOp::Lt => "<".to_string(),
+            BinOp::Lteq => "<=".to_string(),
+            BinOp::Gt => ">".to_string(),
+            BinOp::Gteq => ">=".to_string(),
+            BinOp::Add => "+".to_string(),
+            BinOp::Sub => "-".to_string(),
+            BinOp::Mul => "*".to_string(),
+            BinOp::Div => "/".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Neg,
     Not,
+}
+
+impl ToString for UnaryOp {
+    fn to_string(&self) -> String {
+        match self {
+            UnaryOp::Neg => "-".to_string(),
+            UnaryOp::Not => "~".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,15 +139,39 @@ pub enum SortDir {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Assignment {
-    pub column: Column,
+    pub column: AssignedColumn,
     pub value: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SelectItems {
-    pub column: Expr,
+pub struct SelectColumn {
+    // SELECT age + salary FROM emp; is a valid SQL query, so
+    // the column here has to be an expression.
+    // Later on when I add aggregate functions this will
+    // help massively, as they will simply be more enums of Expr
+    pub name: Expr,
     // if Expr is a string literal, then alias = string literal
     // if Expr is a unary or binary op, then alias = stringified op (eg SELECT )
     pub alias: String,
-    pub is_star: bool, 
+    pub is_star: bool,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTableColumn {
+    pub name: String,
+    pub c_type: TypeName,
+    pub constraints: ColumnConstraints,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum ColumnConstraints {
+    None,
+    PrimaryKey,
+    Unique,
+    NotNull,
+    UniqueNotNull,
+}
+
+pub type InsertColumn = String;
+pub type CreateIndexColumn = String;
+pub type AssignedColumn = String;

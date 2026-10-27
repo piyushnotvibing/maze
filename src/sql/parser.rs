@@ -1,7 +1,9 @@
 use crate::{
     sql::{
-        Column, ColumnConstraints,
-        ast::{Assignment, BinOp, Expr, SortDir, Stmt, UnaryOp},
+        ast::{
+            Assignment, BinOp, ColumnConstraints, CreateTableColumn, Expr, InsertColumn,
+            SelectColumn, SortDir, Stmt, UnaryOp,
+        },
         lexer::{Literal, Operation, Token, TypeName},
     },
     storage::record::values::Value,
@@ -174,7 +176,7 @@ impl Parser {
                 .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?,
         )?;
         let _ = self.advance()?;
-        let mut into_columns: Option<Vec<Column>> = None;
+        let mut into_columns: Option<Vec<InsertColumn>> = None;
         if *self
             .peek()
             .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
@@ -214,11 +216,10 @@ impl Parser {
                 )
             }
             let mut col = Vec::new();
-            col.push(Column {
-                name: "*".to_string(),
-                alias: None,
-                c_type: None,
-                constraints: ColumnConstraints::None,
+            col.push(SelectColumn {
+                name: Expr::Ident("*".to_owned()),
+                alias: "*".to_owned(),
+                is_star: true,
             });
             col
         } else {
@@ -277,7 +278,7 @@ impl Parser {
     }
 
     /// Parses CREATE ... VALUES ( [[id INT PRIMARY KEY, name TEXT NOT NULL, age INT, salary REAL, passport_photo BLOB UNIQUE]] )
-    fn parse_column_def(&mut self) -> anyhow::Result<Vec<Column>> {
+    fn parse_column_def(&mut self) -> anyhow::Result<Vec<CreateTableColumn>> {
         let mut columns = Vec::new();
 
         let first_col_name = extract_id(
@@ -321,10 +322,9 @@ impl Parser {
             }
             _ => ColumnConstraints::None,
         };
-        columns.push(Column {
+        columns.push(CreateTableColumn {
             name: first_col_name,
-            alias: None,
-            c_type: Some(first_col_type),
+            c_type: first_col_type,
             constraints,
         });
 
@@ -339,9 +339,11 @@ impl Parser {
                     .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?,
             )?;
             let _ = self.advance()?;
-            let c_type = Some(extract_type(self.peek().ok_or_else(|| {
-                anyhow::anyhow!("parser error: parser exhausted tokens")
-            })?)?);
+            let c_type = extract_type(
+                self.peek()
+                    .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?,
+            )?;
+            let _ = self.advance()?;
             let constraints = match self
                 .peek()
                 .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
@@ -373,11 +375,9 @@ impl Parser {
                 }
                 _ => ColumnConstraints::None,
             };
-            let _ = self.advance()?;
 
-            columns.push(Column {
+            columns.push(CreateTableColumn {
                 name,
-                alias: None,
                 c_type,
                 constraints,
             });
@@ -387,14 +387,10 @@ impl Parser {
     }
 
     /// Parses SELECT [[name, age AS unc, dob as DateOfBirth]]... as {{name: name}, {age: unc}, {dob: DateOfBirth}}.
-    fn parse_select_columns(&mut self) -> anyhow::Result<Vec<Column>> {
-        let mut columns: Vec<Column> = Vec::new();
+    fn parse_select_columns(&mut self) -> anyhow::Result<Vec<SelectColumn>> {
+        let mut columns: Vec<SelectColumn> = Vec::new();
 
-        let first_col = extract_id(
-            self.peek()
-                .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?,
-        )?;
-        let _ = self.advance()?;
+        let first_col = self.parse_expr()?;
         let alias = if self.sees(Token::As)? {
             let _ = self.advance()?;
             let alias = extract_id(
@@ -402,15 +398,14 @@ impl Parser {
                     .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?,
             )?;
             let _ = self.advance()?;
-            Some(alias)
+            alias
         } else {
-            None
+            first_col.try_to_string()?
         };
-        columns.push(Column {
+        columns.push(SelectColumn {
             name: first_col,
-            alias: alias,
-            c_type: None,
-            constraints: ColumnConstraints::None,
+            alias,
+            is_star: false,
         });
 
         while let t = self
@@ -419,11 +414,7 @@ impl Parser {
             && *t == Token::Comma
         {
             let _ = self.advance()?;
-            let col = extract_id(
-                self.peek()
-                    .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?,
-            )?;
-            let _ = self.advance()?;
+            let col = self.parse_expr()?;
             let alias = if self.sees(Token::As)? {
                 let _ = self.advance()?;
                 let alias =
@@ -431,15 +422,14 @@ impl Parser {
                         anyhow::anyhow!("parser error: parser exhausted tokens")
                     })?)?;
                 let _ = self.advance()?;
-                Some(alias)
+                alias
             } else {
-                None
+                col.try_to_string()?
             };
-            columns.push(Column {
+            columns.push(SelectColumn {
                 name: col,
                 alias: alias,
-                c_type: None,
-                constraints: ColumnConstraints::None,
+                is_star: false,
             });
         }
 
@@ -447,7 +437,7 @@ impl Parser {
     }
 
     /// Parses INSERT INTO table ( [[name, age]] )...
-    fn parse_columns(&mut self) -> anyhow::Result<Vec<Column>> {
+    fn parse_columns(&mut self) -> anyhow::Result<Vec<InsertColumn>> {
         let mut columns = Vec::new();
 
         let first_col_name = extract_id(
@@ -455,12 +445,7 @@ impl Parser {
                 .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?,
         )?;
         let _ = self.advance()?;
-        columns.push(Column {
-            name: first_col_name,
-            alias: None,
-            c_type: None,
-            constraints: ColumnConstraints::None,
-        });
+        columns.push(first_col_name);
 
         while let t = self
             .peek()
@@ -474,12 +459,7 @@ impl Parser {
             )?;
             let _ = self.advance()?;
 
-            columns.push(Column {
-                name,
-                alias: None,
-                c_type: None,
-                constraints: ColumnConstraints::None,
-            });
+            columns.push(name);
         }
 
         Ok(columns)
@@ -489,7 +469,7 @@ impl Parser {
     fn parse_values(&mut self) -> anyhow::Result<Vec<Value>> {
         let mut values = Vec::new();
 
-        let is_neg = if self.sees(Token::Operation(Operation::Sub))? {
+        let mut is_neg = if self.sees(Token::Operation(Operation::Sub))? {
             let _ = self.advance()?;
             true
         } else {
@@ -544,12 +524,20 @@ impl Parser {
             && *t == Token::Comma
         {
             let _ = self.advance()?;
+            is_neg = if self.sees(Token::Operation(Operation::Sub))? {
+                let _ = self.advance()?;
+                true
+            } else {
+                false
+            };
             let val = match self
                 .peek()
                 .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
             {
                 Token::Literal(l) => match l {
+                    Literal::Int(i) if is_neg => Value::Int(-*i),
                     Literal::Int(i) => Value::Int(*i),
+                    Literal::Float(f) if is_neg => Value::Float(-*f),
                     Literal::Float(f) => Value::Float(*f),
                     Literal::String(t) => Value::Text(t.clone()),
                     Literal::Blob(b) => Value::Blob(b.clone()),
@@ -664,12 +652,7 @@ impl Parser {
         self.expect(Token::Operation(Operation::Eq))?;
         let expr = self.parse_expr()?;
         assignments.push(Assignment {
-            column: Column {
-                name: identity,
-                alias: None,
-                c_type: None,
-                constraints: ColumnConstraints::None,
-            },
+            column: identity,
             value: expr,
         });
 
@@ -687,12 +670,7 @@ impl Parser {
             self.expect(Token::Operation(Operation::Eq))?;
             let expr = self.parse_expr()?;
             assignments.push(Assignment {
-                column: Column {
-                    name: identity,
-                    alias: None,
-                    c_type: None,
-                    constraints: ColumnConstraints::None,
-                },
+                column: identity,
                 value: expr,
             });
         }
@@ -940,30 +918,43 @@ mod tests {
         Parser::new(tokens).parse_expr()
     }
 
-    fn col(
-        name: &str,
-        alias: Option<String>,
-        c_type: Option<TypeName>,
-        constraints: ColumnConstraints,
-    ) -> Column {
-        Column {
+    fn ct_col(name: &str, c_type: TypeName, constraints: ColumnConstraints) -> CreateTableColumn {
+        CreateTableColumn {
             name: name.to_string(),
-            alias,
             c_type,
             constraints,
         }
     }
 
-    fn select_cols(cols: &[&str]) -> Vec<Column> {
-        cols.iter()
-            .map(|name| col(name, None, None, ColumnConstraints::None))
-            .collect()
+    fn insert_cols(names: &[&str]) -> Vec<InsertColumn> {
+        names.iter().map(|n| n.to_string()).collect()
     }
 
-    fn star_cols() -> Vec<Column> {
-        let mut m = Vec::new();
-        m.push(col("*", None, None, ColumnConstraints::None));
-        m
+    // A SelectColumn whose alias is left to default to the stringified expression,
+    // exactly as parse_select_columns does when no explicit AS is present.
+    fn sel(expr: Expr) -> SelectColumn {
+        let alias = expr.try_to_string().unwrap();
+        SelectColumn {
+            name: expr,
+            alias,
+            is_star: false,
+        }
+    }
+
+    fn sel_as(expr: Expr, alias: &str) -> SelectColumn {
+        SelectColumn {
+            name: expr,
+            alias: alias.to_string(),
+            is_star: false,
+        }
+    }
+
+    fn star_sel() -> Vec<SelectColumn> {
+        vec![SelectColumn {
+            name: Expr::Ident("*".to_string()),
+            alias: "*".to_string(),
+            is_star: true,
+        }]
     }
 
     fn ident(s: &str) -> Expr {
@@ -987,12 +978,7 @@ mod tests {
             stmts,
             vec![Stmt::CreateTable {
                 table: "t".to_string(),
-                columns: vec![col(
-                    "id",
-                    None,
-                    Some(TypeName::Integer),
-                    ColumnConstraints::None
-                )],
+                columns: vec![ct_col("id", TypeName::Integer, ColumnConstraints::None)],
             }]
         );
     }
@@ -1007,15 +993,10 @@ mod tests {
             vec![Stmt::CreateTable {
                 table: "employees".to_string(),
                 columns: vec![
-                    col("id", None, Some(TypeName::Integer), ColumnConstraints::None),
-                    col("name", None, Some(TypeName::Text), ColumnConstraints::None),
-                    col(
-                        "salary",
-                        None,
-                        Some(TypeName::Real),
-                        ColumnConstraints::None
-                    ),
-                    col("photo", None, Some(TypeName::Blob), ColumnConstraints::None),
+                    ct_col("id", TypeName::Integer, ColumnConstraints::None),
+                    ct_col("name", TypeName::Text, ColumnConstraints::None),
+                    ct_col("salary", TypeName::Real, ColumnConstraints::None),
+                    ct_col("photo", TypeName::Blob, ColumnConstraints::None),
                 ],
             }]
         );
@@ -1041,6 +1022,104 @@ mod tests {
         assert!(parse_sql("CREATE TABLE t (id INTEGER;").is_err());
     }
 
+    // ---- CREATE TABLE column constraints ----
+
+    #[test]
+    fn column_constraint_primary_key() {
+        let stmts = parse_sql("CREATE TABLE t (id INTEGER PRIMARY KEY);").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::CreateTable {
+                table: "t".to_string(),
+                columns: vec![ct_col("id", TypeName::Integer, ColumnConstraints::PrimaryKey)],
+            }]
+        );
+    }
+
+    #[test]
+    fn column_constraint_unique() {
+        let stmts = parse_sql("CREATE TABLE t (id INTEGER UNIQUE);").unwrap();
+        let Stmt::CreateTable { columns, .. } = &stmts[0] else {
+            panic!("expected a CreateTable statement");
+        };
+        assert_eq!(columns[0].constraints, ColumnConstraints::Unique);
+    }
+
+    #[test]
+    fn column_constraint_not_null() {
+        let stmts = parse_sql("CREATE TABLE t (name TEXT NOT NULL);").unwrap();
+        let Stmt::CreateTable { columns, .. } = &stmts[0] else {
+            panic!("expected a CreateTable statement");
+        };
+        assert_eq!(columns[0].constraints, ColumnConstraints::NotNull);
+    }
+
+    #[test]
+    fn column_constraint_unique_not_null() {
+        let stmts = parse_sql("CREATE TABLE t (name TEXT UNIQUE NOT NULL);").unwrap();
+        let Stmt::CreateTable { columns, .. } = &stmts[0] else {
+            panic!("expected a CreateTable statement");
+        };
+        assert_eq!(columns[0].constraints, ColumnConstraints::UniqueNotNull);
+    }
+
+    #[test]
+    fn column_constraint_not_null_unique_either_order_is_accepted() {
+        let stmts = parse_sql("CREATE TABLE t (name TEXT NOT NULL UNIQUE);").unwrap();
+        let Stmt::CreateTable { columns, .. } = &stmts[0] else {
+            panic!("expected a CreateTable statement");
+        };
+        assert_eq!(columns[0].constraints, ColumnConstraints::UniqueNotNull);
+    }
+
+    #[test]
+    fn column_with_no_constraint_defaults_to_none() {
+        let stmts = parse_sql("CREATE TABLE t (id INTEGER);").unwrap();
+        let Stmt::CreateTable { columns, .. } = &stmts[0] else {
+            panic!("expected a CreateTable statement");
+        };
+        assert_eq!(columns[0].constraints, ColumnConstraints::None);
+    }
+
+    #[test]
+    fn each_constraint_variant_also_parses_on_a_non_first_column() {
+        // parse_column_def duplicates the constraint-matching logic for the
+        // first column and for every column after a comma, so this exercises
+        // that second code path independently rather than trusting it mirrors
+        // the first.
+        let stmts = parse_sql(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT UNIQUE, b TEXT NOT NULL, c TEXT UNIQUE NOT NULL, d TEXT NOT NULL UNIQUE, e TEXT);",
+        )
+        .unwrap();
+        let Stmt::CreateTable { columns, .. } = &stmts[0] else {
+            panic!("expected a CreateTable statement");
+        };
+        assert_eq!(
+            columns
+                .iter()
+                .map(|c| c.constraints.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                ColumnConstraints::PrimaryKey,
+                ColumnConstraints::Unique,
+                ColumnConstraints::NotNull,
+                ColumnConstraints::UniqueNotNull,
+                ColumnConstraints::UniqueNotNull,
+                ColumnConstraints::None,
+            ]
+        );
+    }
+
+    #[test]
+    fn column_constraint_primary_without_key_is_rejected() {
+        assert!(parse_sql("CREATE TABLE t (id INTEGER PRIMARY);").is_err());
+    }
+
+    #[test]
+    fn column_constraint_not_without_null_is_rejected() {
+        assert!(parse_sql("CREATE TABLE t (id INTEGER NOT);").is_err());
+    }
+
     // ---- CREATE INDEX ----
 
     #[test]
@@ -1051,7 +1130,7 @@ mod tests {
             vec![Stmt::CreateIndex {
                 index: "idx".to_string(),
                 table: "employees".to_string(),
-                on_columns: vec![col("salary", None, None, ColumnConstraints::None)],
+                on_columns: insert_cols(&["salary"]),
                 unique: false,
             }]
         );
@@ -1065,7 +1144,7 @@ mod tests {
             vec![Stmt::CreateIndex {
                 index: "idx".to_string(),
                 table: "employees".to_string(),
-                on_columns: vec![col("salary", None, None, ColumnConstraints::None)],
+                on_columns: insert_cols(&["salary"]),
                 unique: true,
             }]
         );
@@ -1079,11 +1158,7 @@ mod tests {
             vec![Stmt::CreateIndex {
                 index: "idx".to_string(),
                 table: "t".to_string(),
-                on_columns: vec![
-                    col("a", None, None, ColumnConstraints::None),
-                    col("b", None, None, ColumnConstraints::None),
-                    col("c", None, None, ColumnConstraints::None)
-                ],
+                on_columns: insert_cols(&["a", "b", "c"]),
                 unique: false,
             }]
         );
@@ -1103,10 +1178,7 @@ mod tests {
             stmts,
             vec![Stmt::Insert {
                 table: "employees".to_string(),
-                into_columns: Some(vec![
-                    col("id", None, None, ColumnConstraints::None),
-                    col("name", None, None, ColumnConstraints::None)
-                ]),
+                into_columns: Some(insert_cols(&["id", "name"])),
                 values: vec![Value::Int(1), Value::Text("Ada".to_string())],
             }]
         );
@@ -1157,6 +1229,52 @@ mod tests {
     }
 
     #[test]
+    fn insert_accepts_a_negative_float_value() {
+        let stmts = parse_sql("INSERT INTO t VALUES (-2.5);").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Insert {
+                table: "t".to_string(),
+                into_columns: None,
+                values: vec![Value::Float(-2.5)],
+            }]
+        );
+    }
+
+    #[test]
+    fn insert_accepts_a_negative_value_in_a_non_first_position() {
+        let stmts = parse_sql("INSERT INTO t VALUES (1, -2);").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Insert {
+                table: "t".to_string(),
+                into_columns: None,
+                values: vec![Value::Int(1), Value::Int(-2)],
+            }]
+        );
+    }
+
+    #[test]
+    fn insert_rejects_a_negative_string_literal() {
+        assert!(parse_sql("INSERT INTO t VALUES (-'hi');").is_err());
+    }
+
+    #[test]
+    fn insert_rejects_a_negative_null_literal() {
+        assert!(parse_sql("INSERT INTO t VALUES (-NULL);").is_err());
+    }
+
+    #[test]
+    fn insert_rejects_a_negative_blob_literal() {
+        assert!(parse_sql("INSERT INTO t VALUES (-X'ab');").is_err());
+    }
+
+    #[test]
+    fn insert_rejects_a_doubly_negated_literal() {
+        assert!(parse_sql("INSERT INTO t VALUES (--1);").is_err());
+    }
+
+    #[test]
     fn insert_rejects_arity_mismatch_between_columns_and_values() {
         assert!(parse_sql("INSERT INTO t (id, name) VALUES (1);").is_err());
     }
@@ -1175,7 +1293,7 @@ mod tests {
             stmts,
             vec![Stmt::Select {
                 table: "employees".to_string(),
-                select_columns: star_cols(),
+                select_columns: star_sel(),
                 where_clause: None,
                 order_by: None,
                 limit: None,
@@ -1190,20 +1308,7 @@ mod tests {
             stmts,
             vec![Stmt::Select {
                 table: "employees".to_string(),
-                select_columns: vec![
-                    Column {
-                        name: "id".to_owned(),
-                        alias: None,
-                        c_type: None,
-                        constraints: ColumnConstraints::None
-                    },
-                    Column {
-                        name: "name".to_owned(),
-                        alias: None,
-                        c_type: None,
-                        constraints: ColumnConstraints::None
-                    }
-                ],
+                select_columns: vec![sel(ident("id")), sel(ident("name"))],
                 where_clause: None,
                 order_by: None,
                 limit: None,
@@ -1218,16 +1323,38 @@ mod tests {
             stmts,
             vec![Stmt::Select {
                 table: "employees".to_string(),
-                select_columns: vec![Column {
-                    name: "name".to_owned(),
-                    alias: Some("unc".to_owned()),
-                    c_type: None,
-                    constraints: ColumnConstraints::None
-                }],
+                select_columns: vec![sel_as(ident("name"), "unc")],
                 where_clause: None,
                 order_by: None,
                 limit: None,
             }]
+        );
+    }
+
+    #[test]
+    fn select_with_multiple_aliased_columns() {
+        let stmts = parse_sql("SELECT name AS n, age AS a FROM employees;").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Select {
+                table: "employees".to_string(),
+                select_columns: vec![sel_as(ident("name"), "n"), sel_as(ident("age"), "a")],
+                where_clause: None,
+                order_by: None,
+                limit: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn select_mixes_aliased_and_unaliased_columns() {
+        let stmts = parse_sql("SELECT id, name AS n FROM employees;").unwrap();
+        let Stmt::Select { select_columns, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(
+            *select_columns,
+            vec![sel(ident("id")), sel_as(ident("name"), "n")]
         );
     }
 
@@ -1248,12 +1375,7 @@ mod tests {
             stmts,
             vec![Stmt::Select {
                 table: "employees".to_string(),
-                select_columns: vec![Column {
-                    name: "id".to_owned(),
-                    alias: None,
-                    c_type: None,
-                    constraints: ColumnConstraints::None
-                }],
+                select_columns: vec![sel(ident("id"))],
                 where_clause: Some(bin(ident("id"), BinOp::Eq, int(1))),
                 order_by: None,
                 limit: None,
@@ -1268,12 +1390,7 @@ mod tests {
             stmts,
             vec![Stmt::Select {
                 table: "employees".to_string(),
-                select_columns: vec![Column {
-                    name: "id".to_owned(),
-                    alias: None,
-                    c_type: None,
-                    constraints: ColumnConstraints::None
-                }],
+                select_columns: vec![sel(ident("id"))],
                 where_clause: Some(Expr::Unary(
                     UnaryOp::Not,
                     Box::new(bin(ident("id"), BinOp::Eq, int(1)))
@@ -1348,12 +1465,19 @@ mod tests {
 
     #[test]
     fn select_with_arithmetic_projection() {
-        // `select_columns: HashMap<Column, Column>` has no way to hold an
-        // expression, only a bare name — this can't actually succeed until
-        // that type is restructured to hold `Expr`s (see bug report), so for
-        // now this documents the current, honest failure rather than a
-        // fictional AST shape.
-        assert!(parse_sql("SELECT salary + bonus FROM employees;").is_err());
+        // Now that SelectColumn::name is an Expr, a projected arithmetic
+        // expression parses instead of being rejected.
+        let stmts = parse_sql("SELECT salary + bonus FROM employees;").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Select {
+                table: "employees".to_string(),
+                select_columns: vec![sel(bin(ident("salary"), BinOp::Add, ident("bonus")))],
+                where_clause: None,
+                order_by: None,
+                limit: None,
+            }]
+        );
     }
 
     #[test]
@@ -1415,6 +1539,268 @@ mod tests {
         assert!(parse_sql("SELECT id FROM t ORDER BY 5;").is_err());
     }
 
+    // ---- SELECT: projection-expression overhaul ----
+    //
+    // select_columns used to be a Vec of bare, optionally-aliased
+    // identifiers; parse_select_columns now calls parse_expr() for every
+    // item, so the projection list accepts the full expression grammar
+    // (arithmetic, unary minus/NOT, parens, literals), with the alias
+    // defaulting to Expr::try_to_string() when no explicit AS is given.
+
+    #[test]
+    fn select_projection_accepts_a_unary_minus_expression() {
+        let stmts = parse_sql("SELECT -age FROM employees;").unwrap();
+        let Stmt::Select { select_columns, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(
+            *select_columns,
+            vec![sel(Expr::Unary(UnaryOp::Neg, Box::new(ident("age"))))]
+        );
+    }
+
+    #[test]
+    fn select_projection_accepts_a_not_expression() {
+        let stmts = parse_sql("SELECT NOT flag FROM t;").unwrap();
+        let Stmt::Select { select_columns, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(
+            *select_columns,
+            vec![sel(Expr::Unary(UnaryOp::Not, Box::new(ident("flag"))))]
+        );
+    }
+
+    #[test]
+    fn select_projection_accepts_a_parenthesized_expression() {
+        let stmts = parse_sql("SELECT (a + b) * c FROM t;").unwrap();
+        let Stmt::Select { select_columns, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(
+            *select_columns,
+            vec![sel(bin(
+                bin(ident("a"), BinOp::Add, ident("b")),
+                BinOp::Mul,
+                ident("c"),
+            ))]
+        );
+    }
+
+    #[test]
+    fn select_projection_accepts_a_bare_literal() {
+        let stmts = parse_sql("SELECT 1 FROM t;").unwrap();
+        let Stmt::Select { select_columns, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(*select_columns, vec![sel(int(1))]);
+    }
+
+    #[test]
+    fn select_projection_default_alias_is_the_stringified_expression() {
+        let stmts = parse_sql("SELECT salary + bonus FROM employees;").unwrap();
+        let Stmt::Select { select_columns, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(select_columns[0].alias, "salary + bonus");
+    }
+
+    #[test]
+    fn select_projection_explicit_alias_overrides_the_default() {
+        let stmts = parse_sql("SELECT salary + bonus AS total FROM employees;").unwrap();
+        let Stmt::Select { select_columns, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(
+            *select_columns,
+            vec![sel_as(bin(ident("salary"), BinOp::Add, ident("bonus")), "total")]
+        );
+    }
+
+    #[test]
+    fn select_mixes_expression_and_identifier_columns() {
+        let stmts = parse_sql("SELECT id, salary + bonus AS total, -age FROM employees;").unwrap();
+        let Stmt::Select { select_columns, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(
+            *select_columns,
+            vec![
+                sel(ident("id")),
+                sel_as(bin(ident("salary"), BinOp::Add, ident("bonus")), "total"),
+                sel(Expr::Unary(UnaryOp::Neg, Box::new(ident("age")))),
+            ]
+        );
+    }
+
+    #[test]
+    fn select_projection_expression_combined_with_where_order_by_and_limit() {
+        // The overhaul to parse_expr()-based projections must not disturb
+        // parsing of the clauses that follow the projection list.
+        let stmts = parse_sql(
+            "SELECT salary + bonus AS total FROM employees WHERE total > 1000 ORDER BY total DESC LIMIT 10;",
+        )
+        .unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Select {
+                table: "employees".to_string(),
+                select_columns: vec![sel_as(
+                    bin(ident("salary"), BinOp::Add, ident("bonus")),
+                    "total"
+                )],
+                where_clause: Some(bin(ident("total"), BinOp::Gt, int(1000))),
+                order_by: Some((ident("total"), SortDir::Desc)),
+                limit: Some(10),
+            }]
+        );
+    }
+
+    #[test]
+    fn select_rejects_a_reserved_type_keyword_used_as_a_column_alias() {
+        // "real" lexes as Token::DataType(Real), never Token::Id, regardless
+        // of position — so it can never satisfy extract_id when used as an
+        // alias.
+        assert!(parse_sql("SELECT name AS real FROM employees;").is_err());
+    }
+
+    #[test]
+    fn select_where_accepts_a_bare_unary_negation_with_no_comparison() {
+        // Mirrors select_where_accepts_a_bare_expression_with_no_comparison,
+        // but through the factor -> unary-minus path instead of a plain ident.
+        let stmts = parse_sql("SELECT id FROM t WHERE -balance;").unwrap();
+        let Stmt::Select { where_clause, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(
+            *where_clause,
+            Some(Expr::Unary(UnaryOp::Neg, Box::new(ident("balance"))))
+        );
+    }
+
+    #[test]
+    fn select_where_lets_null_participate_in_arithmetic() {
+        // The exact case called out in sql/mod.rs's grammar comment: NULL is
+        // a <literal>, so it can sit on either side of an arithmetic
+        // operator inside a comparison.
+        let stmts = parse_sql("SELECT id FROM t WHERE salary = 30000 + NULL;").unwrap();
+        let Stmt::Select { where_clause, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(
+            *where_clause,
+            Some(bin(
+                ident("salary"),
+                BinOp::Eq,
+                bin(int(30000), BinOp::Add, Expr::Literal(Literal::Null)),
+            ))
+        );
+    }
+
+    #[test]
+    fn select_where_unary_minus_applies_to_a_parenthesized_expression() {
+        let stmts = parse_sql("SELECT id FROM t WHERE -(a + b) = c;").unwrap();
+        let Stmt::Select { where_clause, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(
+            *where_clause,
+            Some(bin(
+                Expr::Unary(
+                    UnaryOp::Neg,
+                    Box::new(bin(ident("a"), BinOp::Add, ident("b")))
+                ),
+                BinOp::Eq,
+                ident("c"),
+            ))
+        );
+    }
+
+    #[test]
+    fn select_where_not_equal_via_angle_brackets() {
+        let stmts = parse_sql("SELECT id FROM t WHERE a <> b;").unwrap();
+        let Stmt::Select { where_clause, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(*where_clause, Some(bin(ident("a"), BinOp::Ne, ident("b"))));
+    }
+
+    #[test]
+    fn select_where_not_equal_via_bang_equals() {
+        let stmts = parse_sql("SELECT id FROM t WHERE a != b;").unwrap();
+        let Stmt::Select { where_clause, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(*where_clause, Some(bin(ident("a"), BinOp::Ne, ident("b"))));
+    }
+
+    #[test]
+    fn select_where_rejects_a_doubled_not() {
+        // <not_expr> ::= [ "NOT" ] <comparison> allows at most one leading
+        // NOT; a second one has no comparison left to apply to.
+        assert!(parse_sql("SELECT id FROM t WHERE NOT NOT a = 1;").is_err());
+    }
+
+    #[test]
+    fn select_where_deeply_nested_parentheses_unwrap_correctly() {
+        let stmts = parse_sql("SELECT id FROM t WHERE (((a = 1)));").unwrap();
+        let Stmt::Select { where_clause, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(*where_clause, Some(bin(ident("a"), BinOp::Eq, int(1))));
+    }
+
+    #[test]
+    fn select_with_explicit_asc_order_by() {
+        let stmts = parse_sql("SELECT id FROM t ORDER BY id ASC;").unwrap();
+        let Stmt::Select { order_by, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(*order_by, Some((ident("id"), SortDir::Asc)));
+    }
+
+    #[test]
+    fn select_with_limit_zero_is_valid() {
+        let stmts = parse_sql("SELECT id FROM t LIMIT 0;").unwrap();
+        let Stmt::Select { limit, .. } = &stmts[0] else {
+            panic!("expected a Select statement");
+        };
+        assert_eq!(*limit, Some(0));
+    }
+
+    #[test]
+    fn select_combines_aliases_not_and_or_parens_arithmetic_order_by_and_limit() {
+        let stmts = parse_sql(
+            "SELECT id AS i, name AS n FROM employees WHERE NOT (salary + bonus <= 50000 AND age > 30) OR active = 1 ORDER BY id DESC LIMIT 100;",
+        )
+        .unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Select {
+                table: "employees".to_string(),
+                select_columns: vec![sel_as(ident("id"), "i"), sel_as(ident("name"), "n")],
+                where_clause: Some(bin(
+                    Expr::Unary(
+                        UnaryOp::Not,
+                        Box::new(bin(
+                            bin(
+                                bin(ident("salary"), BinOp::Add, ident("bonus")),
+                                BinOp::Lteq,
+                                int(50000),
+                            ),
+                            BinOp::And,
+                            bin(ident("age"), BinOp::Gt, int(30)),
+                        )),
+                    ),
+                    BinOp::Or,
+                    bin(ident("active"), BinOp::Eq, int(1)),
+                )),
+                order_by: Some((ident("id"), SortDir::Desc)),
+                limit: Some(100),
+            }]
+        );
+    }
+
     // ---- UPDATE ----
 
     #[test]
@@ -1425,7 +1811,7 @@ mod tests {
             vec![Stmt::Update {
                 table: "employees".to_string(),
                 set: vec![Assignment {
-                    column: col("name", None, None, ColumnConstraints::None),
+                    column: "name".to_string(),
                     value: Expr::Literal(Literal::String("Bob".to_string())),
                 }],
                 where_clause: Some(bin(ident("id"), BinOp::Eq, int(1))),
@@ -1443,11 +1829,11 @@ mod tests {
             *set,
             vec![
                 Assignment {
-                    column: col("name", None, None, ColumnConstraints::None),
+                    column: "name".to_string(),
                     value: Expr::Literal(Literal::String("Bob".to_string())),
                 },
                 Assignment {
-                    column: col("age", None, None, ColumnConstraints::None),
+                    column: "age".to_string(),
                     value: int(30),
                 },
             ]
