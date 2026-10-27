@@ -65,3 +65,19 @@ Database header size = 23B (as of now)
     - unique enforced via a pre-insert `range_scan` check when `unique = true`
 ## Cross Value ordering
 $\text{Null} \lt \text{(Integer, Real)} \lt \text{Text} \lt \text{Blob}$
+
+## SQL Parsing
+- Mixed case SQL keywords are not allowed. Either all low or all caps.
+- Data of type `BLOB` must be in hexadecimal format.
+- Supported:
+    - Statements `CREATE TABLE/INDEX`, `SELECT`, `INSERT`, `UPDATE`, `DELETE`.
+    - Clauses `WHERE`, `ORDER  BY`, `LIMIT`. 
+- Not supported:
+    - No `DROP TABLE` support yet, but this is a TODO.
+    - No `JOIN` support yet, but this is a TODO.
+    - No `GROUP BY` support yet, but this is a TODO.
+    - No aggregate functions like `COUNT()`, `AVG()` etc support yet, but this is a TODO. 
+    - Nested SQL queries (subqueries) are not supported yet.
+    - TCL, DCL and `ALTER TABLE` commands aren't supported yet.
+    - No window functions support.
+    - `SELECT` statements without a `FROM` clause is not yet supported.

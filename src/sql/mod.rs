@@ -19,7 +19,7 @@ pub mod parser;
     <statement>       ::= <create_table>; | <create_index>; | <insert>; | <select>; | <update>; | <delete>;
 
     <create_table>    ::= "CREATE" "TABLE" <ident> "(" <column_def> { "," <column_def> } ")"
-    <column_def>      ::= <ident> <type_name>
+    <column_def>      ::= <ident> <type_name> [ "PRIMARY" "KEY" | "UNIQUE" | "NOT" "NULL" | "UNIQUE" "NOT" "NULL" | "NOT" "NULL" "UNIQUE" ]
     <type_name>       ::= "INTEGER" | "TEXT" | "REAL" | "BLOB"
 
     <create_index>    ::= "CREATE" [ "UNIQUE" ] "INDEX" <ident> "ON" <ident> "(" <ident> { "," <ident> } ")"
@@ -62,10 +62,26 @@ pub mod parser;
         => salary = NULL
         => UNKNOWN
     the WHERE filter evaluates to UNKNOWN, which returns 0 rows. 
+
+    -> a column definition can be 
+        -> col <type> UNIQUE NOT NULL
+        -> col <type> NOT NULL UNIQUE
+        -> col <type> PRIMARY KEY
 */
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Column {
-    name: String,
-    c_type: Option<TypeName>,
+    pub name: String,
+    pub alias: Option<String>,
+    pub c_type: Option<TypeName>,
+    pub constraints: ColumnConstraints,
 }
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum ColumnConstraints {
+    None,
+    PrimaryKey,
+    Unique,
+    NotNull,
+    UniqueNotNull
+} 

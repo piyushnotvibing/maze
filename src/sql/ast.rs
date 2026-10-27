@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::{
     sql::{Column, lexer::Literal},
     storage::record::values::Value,
@@ -31,16 +29,11 @@ pub enum Stmt {
         values: Vec<Value>,
     },
 
-    /*
-        If the insert query is like
-        SELECT * FROM employees;
-        then select_columns = None.
-    */
     Select {
         table: String,
         // SELECT name as EMP_NAME, age FROM ... is stored as Some({{name: EMP_NAME}, {age: age}})
         // If SELECT * FROM..., then Some({{"*": "*"}})
-        select_columns: HashMap<Column, Column>,
+        select_columns: Vec<Column>,
         where_clause: Option<Expr>,
         order_by: Option<(Expr, SortDir)>,
         limit: Option<u64>,
@@ -100,7 +93,11 @@ pub struct Assignment {
     pub value: Expr,
 }
 
-// "... WHERE [id = 10]" and "UPDATE table SET [id = 10]"
-// in first scenario, the struct means comparison
-// in the second scenario, the struct means assignment
-pub type Comparison = Assignment;
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectItems {
+    pub column: Expr,
+    // if Expr is a string literal, then alias = string literal
+    // if Expr is a unary or binary op, then alias = stringified op (eg SELECT )
+    pub alias: String,
+    pub is_star: bool, 
+}

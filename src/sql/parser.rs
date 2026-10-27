@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-
 use crate::{
     sql::{
-        Column,
+        Column, ColumnConstraints,
         ast::{Assignment, BinOp, Expr, SortDir, Stmt, UnaryOp},
         lexer::{Literal, Operation, Token, TypeName},
     },
@@ -21,6 +19,13 @@ impl Parser {
 
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
+    }
+
+    fn sees(&self, want: Token) -> anyhow::Result<bool> {
+        Ok(*self
+            .peek()
+            .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
+            == want)
     }
 
     fn advance(&mut self) -> anyhow::Result<Token> {
@@ -46,7 +51,7 @@ impl Parser {
 
     /*============================ Grammar Functions ============================*/
 
-    // Entry point.
+    /// Entry point.
     fn parse_statements(&mut self) -> anyhow::Result<Vec<Stmt>> {
         let mut stmts = Vec::new();
 
@@ -54,7 +59,6 @@ impl Parser {
         if stmt1.is_none() {
             anyhow::bail!("parser error: this is literally a blank sql string")
         }
-        let _ = self.advance()?;
         stmts.push(stmt1.unwrap());
 
         while let t = self
@@ -69,7 +73,7 @@ impl Parser {
             }
             stmts.push(stmt.unwrap());
         }
-        self.expect(Token::Semicolon)?;
+        self.expect(Token::Eof)?;
 
         Ok(stmts)
     }
@@ -185,6 +189,14 @@ impl Parser {
         let values = self.parse_values()?;
         self.expect(Token::RParen)?;
 
+        if let Some(ic) = into_columns.as_ref()
+            && ic.len() != values.len()
+        {
+            anyhow::bail!(
+                "parser error: in an INSERT statement the #columns to insert into != #values"
+            )
+        }
+
         Ok(Stmt::Insert {
             table,
             into_columns,
@@ -193,23 +205,22 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> anyhow::Result<Stmt> {
-        let select_columns = if *self
-            .peek()
-            .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
-            == Token::Star
-        {
-            let mut map = HashMap::new();
-            map.insert(
-                Column {
-                    name: "*".to_string(),
-                    c_type: None,
-                },
-                Column {
-                    name: "*".to_string(),
-                    c_type: None,
-                },
-            );
-            map
+        let select_columns = if self.sees(Token::Star)? {
+            let _ = self.advance()?;
+            if self.sees(Token::Comma)? {
+                anyhow::bail!(
+                    "parser error: expected FROM, found {:?}",
+                    self.peek().unwrap()
+                )
+            }
+            let mut col = Vec::new();
+            col.push(Column {
+                name: "*".to_string(),
+                alias: None,
+                c_type: None,
+                constraints: ColumnConstraints::None,
+            });
+            col
         } else {
             self.parse_select_columns()?
         };
@@ -241,7 +252,6 @@ impl Parser {
         let _ = self.advance()?;
         self.expect(Token::Set)?;
         let set = self.parse_assignment()?;
-        let _ = self.advance()?;
         let where_clause = self.parse_where_clause()?;
 
         Ok(Stmt::Update {
@@ -280,9 +290,42 @@ impl Parser {
                 .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?,
         )?;
         let _ = self.advance()?;
+        let constraints = match self
+            .peek()
+            .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
+        {
+            Token::Primary => {
+                let _ = self.advance()?;
+                self.expect(Token::Key)?;
+                ColumnConstraints::PrimaryKey
+            }
+            Token::Unique => {
+                let _ = self.advance()?;
+                if self.sees(Token::Not)? {
+                    let _ = self.advance()?;
+                    self.expect(Token::Literal(Literal::Null))?;
+                    ColumnConstraints::UniqueNotNull
+                } else {
+                    ColumnConstraints::Unique
+                }
+            }
+            Token::Not => {
+                let _ = self.advance()?;
+                self.expect(Token::Literal(Literal::Null))?;
+                if self.sees(Token::Unique)? {
+                    let _ = self.advance()?;
+                    ColumnConstraints::UniqueNotNull
+                } else {
+                    ColumnConstraints::NotNull
+                }
+            }
+            _ => ColumnConstraints::None,
+        };
         columns.push(Column {
             name: first_col_name,
+            alias: None,
             c_type: Some(first_col_type),
+            constraints,
         });
 
         while let t = self
@@ -299,54 +342,76 @@ impl Parser {
             let c_type = Some(extract_type(self.peek().ok_or_else(|| {
                 anyhow::anyhow!("parser error: parser exhausted tokens")
             })?)?);
+            let constraints = match self
+                .peek()
+                .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
+            {
+                Token::Primary => {
+                    let _ = self.advance()?;
+                    self.expect(Token::Key)?;
+                    ColumnConstraints::PrimaryKey
+                }
+                Token::Unique => {
+                    let _ = self.advance()?;
+                    if self.sees(Token::Not)? {
+                        let _ = self.advance()?;
+                        self.expect(Token::Literal(Literal::Null))?;
+                        ColumnConstraints::UniqueNotNull
+                    } else {
+                        ColumnConstraints::Unique
+                    }
+                }
+                Token::Not => {
+                    let _ = self.advance()?;
+                    self.expect(Token::Literal(Literal::Null))?;
+                    if self.sees(Token::Unique)? {
+                        let _ = self.advance()?;
+                        ColumnConstraints::UniqueNotNull
+                    } else {
+                        ColumnConstraints::NotNull
+                    }
+                }
+                _ => ColumnConstraints::None,
+            };
             let _ = self.advance()?;
 
-            columns.push(Column { name, c_type });
+            columns.push(Column {
+                name,
+                alias: None,
+                c_type,
+                constraints,
+            });
         }
 
         Ok(columns)
     }
 
     /// Parses SELECT [[name, age AS unc, dob as DateOfBirth]]... as {{name: name}, {age: unc}, {dob: DateOfBirth}}.
-    /// Advances the parser position after parsing the last column.
-    fn parse_select_columns(&mut self) -> anyhow::Result<HashMap<Column, Column>> {
-        let mut columns: HashMap<Column, Column> = HashMap::new();
+    fn parse_select_columns(&mut self) -> anyhow::Result<Vec<Column>> {
+        let mut columns: Vec<Column> = Vec::new();
 
         let first_col = extract_id(
             self.peek()
                 .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?,
         )?;
         let _ = self.advance()?;
-        let alias = if let t = self
-            .peek()
-            .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
-            && *t == Token::As
-        {
+        let alias = if self.sees(Token::As)? {
+            let _ = self.advance()?;
             let alias = extract_id(
                 self.peek()
                     .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?,
             )?;
             let _ = self.advance()?;
-            alias
+            Some(alias)
         } else {
-            first_col.clone()
+            None
         };
-        if first_col == "*"
-        {
-            anyhow::bail!(
-                "parser error: * captures all columns, so adding other columns after * in a SELECT statement makes no sense"
-            )
-        }
-        columns.insert(
-            Column {
-                name: first_col,
-                c_type: None,
-            },
-            Column {
-                name: alias,
-                c_type: None,
-            },
-        );
+        columns.push(Column {
+            name: first_col,
+            alias: alias,
+            c_type: None,
+            constraints: ColumnConstraints::None,
+        });
 
         while let t = self
             .peek()
@@ -359,37 +424,29 @@ impl Parser {
                     .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?,
             )?;
             let _ = self.advance()?;
-            let alias = if let t = self
-                .peek()
-                .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
-                && *t == Token::As
-            {
+            let alias = if self.sees(Token::As)? {
+                let _ = self.advance()?;
                 let alias =
                     extract_id(self.peek().ok_or_else(|| {
                         anyhow::anyhow!("parser error: parser exhausted tokens")
                     })?)?;
                 let _ = self.advance()?;
-                alias
+                Some(alias)
             } else {
-                col.clone()
+                None
             };
-            columns.insert(
-                Column {
-                    name: col,
-                    c_type: None,
-                },
-                Column {
-                    name: alias,
-                    c_type: None,
-                },
-            );
+            columns.push(Column {
+                name: col,
+                alias: alias,
+                c_type: None,
+                constraints: ColumnConstraints::None,
+            });
         }
 
         Ok(columns)
     }
 
     /// Parses INSERT INTO table ( [[name, age]] )...
-    /// Advances the parser position after parsing the last column.
     fn parse_columns(&mut self) -> anyhow::Result<Vec<Column>> {
         let mut columns = Vec::new();
 
@@ -400,7 +457,9 @@ impl Parser {
         let _ = self.advance()?;
         columns.push(Column {
             name: first_col_name,
+            alias: None,
             c_type: None,
+            constraints: ColumnConstraints::None,
         });
 
         while let t = self
@@ -415,27 +474,64 @@ impl Parser {
             )?;
             let _ = self.advance()?;
 
-            columns.push(Column { name, c_type: None });
+            columns.push(Column {
+                name,
+                alias: None,
+                c_type: None,
+                constraints: ColumnConstraints::None,
+            });
         }
 
         Ok(columns)
     }
 
     /// Parses INSERT ... VALUES ( [[10, 'peter parker', 25, 50000.55, X'asidjsa2112321le12jkkjbk3j1h4j1k23']] )
-    /// Advances the parser position after parsing the last value.
     fn parse_values(&mut self) -> anyhow::Result<Vec<Value>> {
         let mut values = Vec::new();
 
+        let is_neg = if self.sees(Token::Operation(Operation::Sub))? {
+            let _ = self.advance()?;
+            true
+        } else {
+            false
+        };
         let first_val = match self
             .peek()
             .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
         {
             Token::Literal(l) => match l {
-                Literal::Int(i) => Value::Int(*i),
-                Literal::Float(f) => Value::Float(*f),
-                Literal::String(t) => Value::Text(t.clone()),
-                Literal::Blob(b) => Value::Blob(b.clone()),
-                Literal::Null => Value::Null,
+                Literal::Int(i) => {
+                    if is_neg {
+                        Value::Int(-*i)
+                    } else {
+                        Value::Int(*i)
+                    }
+                }
+                Literal::Float(f) => {
+                    if is_neg {
+                        Value::Float(-*f)
+                    } else {
+                        Value::Float(*f)
+                    }
+                }
+                Literal::String(t) => {
+                    if is_neg {
+                        anyhow::bail!("parser error: a string cannot be negative")
+                    }
+                    Value::Text(t.clone())
+                }
+                Literal::Blob(b) => {
+                    if is_neg {
+                        anyhow::bail!("parser error: a blob cannot be negative")
+                    }
+                    Value::Blob(b.clone())
+                }
+                Literal::Null => {
+                    if is_neg {
+                        anyhow::bail!("parser error: NULL cannot be negative")
+                    }
+                    Value::Null
+                }
             },
             t => anyhow::bail!("parser error: expected a literal, found {t:?}"),
         };
@@ -470,7 +566,6 @@ impl Parser {
     }
 
     /// Parses WHERE [[name = 'peter parker' AND/OR age <> 25 AND salary > 25000.67]]
-    /// Does not advance the parser position after parsing the last value.
     fn parse_where_clause(&mut self) -> anyhow::Result<Option<Expr>> {
         match self
             .peek()
@@ -479,7 +574,6 @@ impl Parser {
             Token::Where => {
                 let _ = self.advance()?;
                 let res = Ok(Some(self.parse_expr()?));
-                let _ = self.advance()?;
                 res
             }
             _ => Ok(None),
@@ -487,7 +581,6 @@ impl Parser {
     }
 
     /// Parses ORDER BY [[salary ASC/DESC]]
-    /// Does NOT advance the parser position after parsing the column.
     fn parse_order_by(&mut self) -> anyhow::Result<Option<(Expr, SortDir)>> {
         match self
             .peek()
@@ -505,18 +598,15 @@ impl Parser {
                             anyhow::anyhow!("parser error: parser exhausted tokens")
                         })?)?;
                         let _ = self.advance();
-                        match self.peek().ok_or_else(|| {
-                            anyhow::anyhow!("parser error: parser exhausted tokens")
-                        })? {
-                            Token::Asc => {
-                                let _ = self.advance()?;
-                                Ok(Some((Expr::Ident(identity), SortDir::Asc)))
-                            }
-                            Token::Desc => {
-                                let _ = self.advance()?;
-                                Ok(Some((Expr::Ident(identity), SortDir::Desc)))
-                            }
-                            t => anyhow::bail!("parser error: expected ASC/DESC, found {t:?}"),
+                        if self.sees(Token::Asc)? {
+                            let _ = self.advance()?;
+                            Ok(Some((Expr::Ident(identity), SortDir::Asc)))
+                        } else if self.sees(Token::Desc)? {
+                            let _ = self.advance()?;
+                            Ok(Some((Expr::Ident(identity), SortDir::Desc)))
+                        } else {
+                            let _ = self.advance()?;
+                            Ok(Some((Expr::Ident(identity), SortDir::Asc)))
                         }
                     }
                     t => anyhow::bail!("parser error: expected BY, found {t:?}"),
@@ -527,7 +617,6 @@ impl Parser {
     }
 
     /// Parses LIMIT [[10]]
-    /// Does not advance the parser position after parsing the integer.
     fn parse_limit(&mut self) -> anyhow::Result<Option<u64>> {
         match self
             .peek()
@@ -562,7 +651,6 @@ impl Parser {
     }
 
     /// Parses UPDATE table SET [[name = 'Peter Parker', age = 25]]...
-    /// Does not advance the parser position after parsing the last value.
     /// Note: Assignment in SET clauses and Comparison in WHERE clauses are different,
     /// and are parsed differently.
     fn parse_assignment(&mut self) -> anyhow::Result<Vec<Assignment>> {
@@ -575,11 +663,12 @@ impl Parser {
         let _ = self.advance()?;
         self.expect(Token::Operation(Operation::Eq))?;
         let expr = self.parse_expr()?;
-        let _ = self.advance()?;
         assignments.push(Assignment {
             column: Column {
                 name: identity,
+                alias: None,
                 c_type: None,
+                constraints: ColumnConstraints::None,
             },
             value: expr,
         });
@@ -597,11 +686,12 @@ impl Parser {
             let _ = self.advance()?;
             self.expect(Token::Operation(Operation::Eq))?;
             let expr = self.parse_expr()?;
-            let _ = self.advance()?;
             assignments.push(Assignment {
                 column: Column {
                     name: identity,
+                    alias: None,
                     c_type: None,
+                    constraints: ColumnConstraints::None,
                 },
                 value: expr,
             });
@@ -616,7 +706,6 @@ impl Parser {
 
     fn parse_or_expr(&mut self) -> anyhow::Result<Expr> {
         let and_expr = self.parse_and_expr()?;
-        self.advance()?;
 
         if *self
             .peek()
@@ -627,7 +716,7 @@ impl Parser {
             let and_expr2 = self.parse_and_expr()?;
             return Ok(Expr::Binary(
                 Box::new(and_expr),
-                BinOp::And,
+                BinOp::Or,
                 Box::new(and_expr2),
             ));
         }
@@ -637,12 +726,11 @@ impl Parser {
 
     fn parse_and_expr(&mut self) -> anyhow::Result<Expr> {
         let not_expr = self.parse_not_expr()?;
-        self.advance()?;
 
         if *self
             .peek()
             .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
-            == Token::Or
+            == Token::And
         {
             let _ = self.advance()?;
             let not_expr2 = self.parse_not_expr()?;
@@ -657,25 +745,26 @@ impl Parser {
     }
 
     fn parse_not_expr(&mut self) -> anyhow::Result<Expr> {
-        self.expect(Token::Not)?;
-        self.parse_comparison()
+        if self.sees(Token::Not)? {
+            let _ = self.advance()?;
+            Ok(Expr::Unary(
+                UnaryOp::Not,
+                Box::new(self.parse_comparison()?),
+            ))
+        } else {
+            self.parse_comparison()
+        }
     }
 
     fn parse_comparison(&mut self) -> anyhow::Result<Expr> {
-        let arith_expr1 = self.parse_arith_expr()?;
-        let _ = self.advance()?;
-        let op1 = extract_comp_op(
-            self.peek()
-                .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?,
-        )?;
-        let arith_expr2 = self.parse_arith_expr()?;
-        let _ = self.advance()?;
+        let mut arith_expr1 = self.parse_arith_expr()?;
 
-        let mut expr = Expr::Binary(
-            Box::new(arith_expr1),
-            op1.to_bin_op(),
-            Box::new(arith_expr2),
-        );
+        if self.sees(Token::Operation(Operation::Eq))? {
+            let _ = self.advance()?;
+            let arith_expr2 = self.parse_arith_expr()?;
+            arith_expr1 = Expr::Binary(Box::new(arith_expr1), BinOp::Eq, Box::new(arith_expr2));
+            return Ok(arith_expr1);
+        }
 
         loop {
             let token = self
@@ -687,65 +776,77 @@ impl Parser {
 
             let op = extract_comp_op(token)?;
             if !op.is_comp_op() {
-                anyhow::bail!("parser error: expected a comparison operator, found {op1:?}")
+                anyhow::bail!("parser error: expected a comparison operator, found {op:?}")
             }
             let _ = self.advance()?;
             let arith_expr = self.parse_arith_expr()?;
-            let _ = self.advance()?;
 
-            expr = Expr::Binary(Box::new(expr), op.to_bin_op(), Box::new(arith_expr))
+            arith_expr1 = Expr::Binary(Box::new(arith_expr1), op.to_bin_op(), Box::new(arith_expr))
         }
-        let _ = self.advance()?;
 
-        Ok(expr)
+        Ok(arith_expr1)
     }
 
     fn parse_arith_expr(&mut self) -> anyhow::Result<Expr> {
-        let term1 = self.parse_term()?;
-        let _ = self.advance()?;
-        let op = match self
-            .peek()
-            .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
-        {
-            Token::Operation(o) => match o {
-                Operation::Add => o.to_bin_op(),
-                Operation::Sub => o.to_bin_op(),
-                _ => anyhow::bail!("parser error: expected + or -, found {o:?}"),
-            },
-            t => anyhow::bail!("parser error: expected + or -, found {t:?}"),
-        };
+        let mut term1 = self.parse_term()?;
 
-        let term2 = self.parse_term()?;
+        loop {
+            if !self.sees(Token::Operation(Operation::Add))?
+                && !self.sees(Token::Operation(Operation::Sub))?
+            {
+                break;
+            }
 
-        Ok(Expr::Binary(Box::new(term1), op, Box::new(term2)))
+            let op = match self
+                .peek()
+                .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
+            {
+                Token::Operation(o) => match o {
+                    Operation::Add => o.to_bin_op(),
+                    Operation::Sub => o.to_bin_op(),
+                    _ => anyhow::bail!("parser error: expected + or -, found {o:?}"),
+                },
+                t => anyhow::bail!("parser error: expected + or -, found {t:?}"),
+            };
+            let _ = self.advance()?;
+            let term = self.parse_term()?;
+
+            term1 = Expr::Binary(Box::new(term1), op, Box::new(term))
+        }
+
+        Ok(term1)
     }
 
     fn parse_term(&mut self) -> anyhow::Result<Expr> {
-        let factor1 = self.parse_factor()?;
-        let _ = self.advance()?;
-        let op = match self
-            .peek()
-            .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
-        {
-            Token::Operation(o) => match o {
-                Operation::Div => o.to_bin_op(),
-                _ => anyhow::bail!("parser error: expected * or /, found {o:?}"),
-            },
-            Token::Star => BinOp::Mul,
-            t => anyhow::bail!("parser error: expected * or /, found {t:?}"),
-        };
+        let mut factor1 = self.parse_factor()?;
 
-        let factor2 = self.parse_factor()?;
+        loop {
+            if !self.sees(Token::Operation(Operation::Div))? && !self.sees(Token::Star)? {
+                break;
+            }
 
-        Ok(Expr::Binary(Box::new(factor1), op, Box::new(factor2)))
+            let op = match self
+                .peek()
+                .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
+            {
+                Token::Operation(o) => match o {
+                    Operation::Div => o.to_bin_op(),
+                    _ => anyhow::bail!("parser error: expected * or /, found {o:?}"),
+                },
+                Token::Star => BinOp::Mul,
+                t => anyhow::bail!("parser error: expected * or /, found {t:?}"),
+            };
+            let _ = self.advance()?;
+            let factor = self.parse_factor()?;
+
+            factor1 = Expr::Binary(Box::new(factor1), op, Box::new(factor))
+        }
+
+        Ok(factor1)
     }
 
     fn parse_factor(&mut self) -> anyhow::Result<Expr> {
-        if *self
-            .peek()
-            .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
-            == Token::Operation(Operation::Sub)
-        {
+        if self.sees(Token::Operation(Operation::Sub))? {
             let sub = UnaryOp::Neg;
             let _ = self.advance()?;
             let primary = self.parse_primary()?;
@@ -760,12 +861,19 @@ impl Parser {
             .peek()
             .ok_or_else(|| anyhow::anyhow!("parser error: parser exhausted tokens"))?
         {
-            Token::Id(s) => Ok(Expr::Ident(s.clone())),
-            Token::Literal(l) => Ok(Expr::Literal(l.clone())),
+            Token::Id(s) => {
+                let res = Ok(Expr::Ident(s.clone()));
+                let _ = self.advance()?;
+                res
+            }
+            Token::Literal(l) => {
+                let res = Ok(Expr::Literal(l.clone()));
+                let _ = self.advance()?;
+                res
+            }
             Token::LParen => {
                 let _ = self.advance()?;
                 let expr = self.parse_expr()?;
-                let _ = self.advance()?;
                 self.expect(Token::RParen)?;
                 Ok(expr)
             }
@@ -815,7 +923,6 @@ fn is_comp_op(token: &Token) -> bool {
         || *token == Token::Operation(Operation::Lteq)
         || *token == Token::Operation(Operation::Gt)
         || *token == Token::Operation(Operation::Gteq)
-        || *token == Token::Operation(Operation::Eq)
         || *token == Token::Operation(Operation::Ne)
 }
 
@@ -833,23 +940,29 @@ mod tests {
         Parser::new(tokens).parse_expr()
     }
 
-    fn col(name: &str, c_type: Option<TypeName>) -> Column {
+    fn col(
+        name: &str,
+        alias: Option<String>,
+        c_type: Option<TypeName>,
+        constraints: ColumnConstraints,
+    ) -> Column {
         Column {
             name: name.to_string(),
+            alias,
             c_type,
+            constraints,
         }
     }
 
-    fn select_cols(pairs: &[(&str, &str)]) -> HashMap<Column, Column> {
-        pairs
-            .iter()
-            .map(|(name, alias)| (col(name, None), col(alias, None)))
+    fn select_cols(cols: &[&str]) -> Vec<Column> {
+        cols.iter()
+            .map(|name| col(name, None, None, ColumnConstraints::None))
             .collect()
     }
 
-    fn star_cols() -> HashMap<Column, Column> {
-        let mut m = HashMap::new();
-        m.insert(col("*", None), col("*", None));
+    fn star_cols() -> Vec<Column> {
+        let mut m = Vec::new();
+        m.push(col("*", None, None, ColumnConstraints::None));
         m
     }
 
@@ -874,7 +987,12 @@ mod tests {
             stmts,
             vec![Stmt::CreateTable {
                 table: "t".to_string(),
-                columns: vec![col("id", Some(TypeName::Integer))],
+                columns: vec![col(
+                    "id",
+                    None,
+                    Some(TypeName::Integer),
+                    ColumnConstraints::None
+                )],
             }]
         );
     }
@@ -889,10 +1007,15 @@ mod tests {
             vec![Stmt::CreateTable {
                 table: "employees".to_string(),
                 columns: vec![
-                    col("id", Some(TypeName::Integer)),
-                    col("name", Some(TypeName::Text)),
-                    col("salary", Some(TypeName::Real)),
-                    col("photo", Some(TypeName::Blob)),
+                    col("id", None, Some(TypeName::Integer), ColumnConstraints::None),
+                    col("name", None, Some(TypeName::Text), ColumnConstraints::None),
+                    col(
+                        "salary",
+                        None,
+                        Some(TypeName::Real),
+                        ColumnConstraints::None
+                    ),
+                    col("photo", None, Some(TypeName::Blob), ColumnConstraints::None),
                 ],
             }]
         );
@@ -928,7 +1051,7 @@ mod tests {
             vec![Stmt::CreateIndex {
                 index: "idx".to_string(),
                 table: "employees".to_string(),
-                on_columns: vec![col("salary", None)],
+                on_columns: vec![col("salary", None, None, ColumnConstraints::None)],
                 unique: false,
             }]
         );
@@ -942,7 +1065,7 @@ mod tests {
             vec![Stmt::CreateIndex {
                 index: "idx".to_string(),
                 table: "employees".to_string(),
-                on_columns: vec![col("salary", None)],
+                on_columns: vec![col("salary", None, None, ColumnConstraints::None)],
                 unique: true,
             }]
         );
@@ -956,7 +1079,11 @@ mod tests {
             vec![Stmt::CreateIndex {
                 index: "idx".to_string(),
                 table: "t".to_string(),
-                on_columns: vec![col("a", None), col("b", None), col("c", None)],
+                on_columns: vec![
+                    col("a", None, None, ColumnConstraints::None),
+                    col("b", None, None, ColumnConstraints::None),
+                    col("c", None, None, ColumnConstraints::None)
+                ],
                 unique: false,
             }]
         );
@@ -976,7 +1103,10 @@ mod tests {
             stmts,
             vec![Stmt::Insert {
                 table: "employees".to_string(),
-                into_columns: Some(vec![col("id", None), col("name", None)]),
+                into_columns: Some(vec![
+                    col("id", None, None, ColumnConstraints::None),
+                    col("name", None, None, ColumnConstraints::None)
+                ]),
                 values: vec![Value::Int(1), Value::Text("Ada".to_string())],
             }]
         );
@@ -997,8 +1127,7 @@ mod tests {
 
     #[test]
     fn insert_accepts_mixed_literal_types_including_null() {
-        let stmts =
-            parse_sql("INSERT INTO t VALUES (1, 2.5, 'hi', NULL);").unwrap();
+        let stmts = parse_sql("INSERT INTO t VALUES (1, 2.5, 'hi', NULL);").unwrap();
         assert_eq!(
             stmts,
             vec![Stmt::Insert {
@@ -1061,7 +1190,20 @@ mod tests {
             stmts,
             vec![Stmt::Select {
                 table: "employees".to_string(),
-                select_columns: select_cols(&[("id", "id"), ("name", "name")]),
+                select_columns: vec![
+                    Column {
+                        name: "id".to_owned(),
+                        alias: None,
+                        c_type: None,
+                        constraints: ColumnConstraints::None
+                    },
+                    Column {
+                        name: "name".to_owned(),
+                        alias: None,
+                        c_type: None,
+                        constraints: ColumnConstraints::None
+                    }
+                ],
                 where_clause: None,
                 order_by: None,
                 limit: None,
@@ -1076,7 +1218,12 @@ mod tests {
             stmts,
             vec![Stmt::Select {
                 table: "employees".to_string(),
-                select_columns: select_cols(&[("name", "unc")]),
+                select_columns: vec![Column {
+                    name: "name".to_owned(),
+                    alias: Some("unc".to_owned()),
+                    c_type: None,
+                    constraints: ColumnConstraints::None
+                }],
                 where_clause: None,
                 order_by: None,
                 limit: None,
@@ -1101,7 +1248,12 @@ mod tests {
             stmts,
             vec![Stmt::Select {
                 table: "employees".to_string(),
-                select_columns: select_cols(&[("id", "id")]),
+                select_columns: vec![Column {
+                    name: "id".to_owned(),
+                    alias: None,
+                    c_type: None,
+                    constraints: ColumnConstraints::None
+                }],
                 where_clause: Some(bin(ident("id"), BinOp::Eq, int(1))),
                 order_by: None,
                 limit: None,
@@ -1116,7 +1268,12 @@ mod tests {
             stmts,
             vec![Stmt::Select {
                 table: "employees".to_string(),
-                select_columns: select_cols(&[("id", "id")]),
+                select_columns: vec![Column {
+                    name: "id".to_owned(),
+                    alias: None,
+                    c_type: None,
+                    constraints: ColumnConstraints::None
+                }],
                 where_clause: Some(Expr::Unary(
                     UnaryOp::Not,
                     Box::new(bin(ident("id"), BinOp::Eq, int(1)))
@@ -1146,8 +1303,7 @@ mod tests {
     #[test]
     fn select_with_where_and_binds_tighter_than_or() {
         // a = 1 OR b = 2 AND c = 3  ==  a = 1 OR (b = 2 AND c = 3)
-        let stmts =
-            parse_sql("SELECT id FROM t WHERE a = 1 OR b = 2 AND c = 3;").unwrap();
+        let stmts = parse_sql("SELECT id FROM t WHERE a = 1 OR b = 2 AND c = 3;").unwrap();
         let Stmt::Select { where_clause, .. } = &stmts[0] else {
             panic!("expected a Select statement");
         };
@@ -1239,8 +1395,7 @@ mod tests {
 
     #[test]
     fn select_with_where_order_by_and_limit_together() {
-        let stmts =
-            parse_sql("SELECT id FROM t WHERE id = 1 ORDER BY id DESC LIMIT 5;").unwrap();
+        let stmts = parse_sql("SELECT id FROM t WHERE id = 1 ORDER BY id DESC LIMIT 5;").unwrap();
         let Stmt::Select {
             where_clause,
             order_by,
@@ -1270,7 +1425,7 @@ mod tests {
             vec![Stmt::Update {
                 table: "employees".to_string(),
                 set: vec![Assignment {
-                    column: col("name", None),
+                    column: col("name", None, None, ColumnConstraints::None),
                     value: Expr::Literal(Literal::String("Bob".to_string())),
                 }],
                 where_clause: Some(bin(ident("id"), BinOp::Eq, int(1))),
@@ -1280,8 +1435,7 @@ mod tests {
 
     #[test]
     fn update_multiple_assignments() {
-        let stmts =
-            parse_sql("UPDATE employees SET name = 'Bob', age = 30 WHERE id = 1;").unwrap();
+        let stmts = parse_sql("UPDATE employees SET name = 'Bob', age = 30 WHERE id = 1;").unwrap();
         let Stmt::Update { set, .. } = &stmts[0] else {
             panic!("expected an Update statement");
         };
@@ -1289,11 +1443,11 @@ mod tests {
             *set,
             vec![
                 Assignment {
-                    column: col("name", None),
+                    column: col("name", None, None, ColumnConstraints::None),
                     value: Expr::Literal(Literal::String("Bob".to_string())),
                 },
                 Assignment {
-                    column: col("age", None),
+                    column: col("age", None, None, ColumnConstraints::None),
                     value: int(30),
                 },
             ]
@@ -1351,7 +1505,11 @@ mod tests {
         let expr = parse_expr_fragment("a + b * c").unwrap();
         assert_eq!(
             expr,
-            bin(ident("a"), BinOp::Add, bin(ident("b"), BinOp::Mul, ident("c")))
+            bin(
+                ident("a"),
+                BinOp::Add,
+                bin(ident("b"), BinOp::Mul, ident("c"))
+            )
         );
     }
 
@@ -1361,7 +1519,11 @@ mod tests {
         let expr = parse_expr_fragment("a - b - c").unwrap();
         assert_eq!(
             expr,
-            bin(bin(ident("a"), BinOp::Sub, ident("b")), BinOp::Sub, ident("c"))
+            bin(
+                bin(ident("a"), BinOp::Sub, ident("b")),
+                BinOp::Sub,
+                ident("c")
+            )
         );
     }
 
@@ -1371,7 +1533,11 @@ mod tests {
         let expr = parse_expr_fragment("(a + b) * c").unwrap();
         assert_eq!(
             expr,
-            bin(bin(ident("a"), BinOp::Add, ident("b")), BinOp::Mul, ident("c"))
+            bin(
+                bin(ident("a"), BinOp::Add, ident("b")),
+                BinOp::Mul,
+                ident("c")
+            )
         );
     }
 
@@ -1391,12 +1557,17 @@ mod tests {
 
     #[test]
     fn full_arithmetic_precedence_chain() {
+        // a + ((b / c) - (d * e))
         // a + b / c - d * e  ==  (a + (b / c)) - (d * e)
         let expr = parse_expr_fragment("a + b / c - d * e").unwrap();
         assert_eq!(
             expr,
             bin(
-                bin(ident("a"), BinOp::Add, bin(ident("b"), BinOp::Div, ident("c"))),
+                bin(
+                    ident("a"),
+                    BinOp::Add,
+                    bin(ident("b"), BinOp::Div, ident("c"))
+                ),
                 BinOp::Sub,
                 bin(ident("d"), BinOp::Mul, ident("e")),
             )

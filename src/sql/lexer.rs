@@ -112,8 +112,8 @@ pub fn tokenize(sql: String) -> anyhow::Result<Vec<Token>> {
     let mut blob_literal = String::new();
 
     let mut skip = false;
-    let mut is_str_char = false;
-    let mut is_blob_char = false;
+
+    let mut which_literal = WhichLiteral::None;
     while let Some(char) = characters.next() {
         if skip {
             skip = false;
@@ -121,170 +121,211 @@ pub fn tokenize(sql: String) -> anyhow::Result<Vec<Token>> {
         }
         let next = characters.peek();
         match char {
-            ' ' if is_str_char && !is_blob_char => string_literal.push(' '),
-            ' ' if !is_blob_char => push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?,
-            '+' if is_str_char && !is_blob_char => string_literal.push('+'),
-            '+' if !is_blob_char => {
-                push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
-                tokens.push(Token::Operation(Operation::Add));
-            }
-            '-' if is_str_char && !is_blob_char => string_literal.push('-'),
-            '-' if !is_blob_char => {
-                push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
-                tokens.push(Token::Operation(Operation::Sub));
-            }
-            '*' if is_str_char && !is_blob_char => string_literal.push('*'),
-            '*' if !is_blob_char => {
-                push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
-                tokens.push(Token::Star);
-            }
-            '/' if is_str_char && !is_blob_char => string_literal.push('/'),
-            '/' if !is_blob_char => {
-                push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
-                tokens.push(Token::Operation(Operation::Div));
-            }
-
-            '(' if is_str_char && !is_blob_char => string_literal.push('('),
-            '(' if !is_blob_char => {
-                push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
-                tokens.push(Token::LParen);
-            }
-            ')' if is_str_char && !is_blob_char => string_literal.push(')'),
-            ')' if !is_blob_char => {
-                push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
-                tokens.push(Token::RParen);
-            }
-            ',' if is_str_char && !is_blob_char => string_literal.push(','),
-            ',' if !is_blob_char => {
-                push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
-                tokens.push(Token::Comma);
-            }
-            ';' if is_str_char && !is_blob_char => string_literal.push(';'),
-            ';' if !is_blob_char => {
-                push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
-                tokens.push(Token::Semicolon);
-            }
-
-            '>' if is_str_char && !is_blob_char => string_literal.push('>'),
-            '>' if !is_blob_char => {
-                push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
-                if let Some(&next_char) = next
-                    && next_char == '='
-                {
-                    tokens.push(Token::Operation(Operation::Gteq));
-                    skip = true;
-                } else {
-                    tokens.push(Token::Operation(Operation::Gt));
+            ' ' => match which_literal {
+                WhichLiteral::None => {
+                    push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?
                 }
-            }
-            '=' if is_str_char => string_literal.push('='),
-            '=' if !is_blob_char => {
-                push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
-                tokens.push(Token::Operation(Operation::Eq))
-            }
-            '<' if is_str_char && !is_blob_char => string_literal.push('<'),
-            '<' if !is_blob_char => {
-                push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
-                if let Some(&next_char) = next {
-                    match next_char {
-                        '=' => {
-                            tokens.push(Token::Operation(Operation::Lteq));
-                            skip = true;
-                        }
-                        '>' => {
-                            tokens.push(Token::Operation(Operation::Ne));
-                            skip = true;
-                        }
-                        _ => tokens.push(Token::Operation(Operation::Lt)),
-                    }
-                } else {
-                    tokens.push(Token::Operation(Operation::Lt));
-                }
-            }
-            '!' if is_str_char && !is_blob_char => string_literal.push('!'),
-            '!' if !is_blob_char => {
-                if let Some(&next_char) = next
-                    && next_char == '='
-                {
+                WhichLiteral::InStr => string_literal.push(' '),
+                WhichLiteral::InBlob => blob_literal.push(' '),
+            },
+            '+' => match which_literal {
+                WhichLiteral::None => {
                     push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
-                    tokens.push(Token::Operation(Operation::Ne));
-                    skip = true;
-                } else {
-                    anyhow::bail!("lexer error: invalid character !")
+                    tokens.push(Token::Operation(Operation::Add));
                 }
-            }
-            '\'' => {
-                if let Some(&next_char) = next
-                    && next_char == '\''
-                {
-                    string_literal.push('\'');
-                    skip = true;
-                    continue;
+                WhichLiteral::InStr => string_literal.push('+'),
+                WhichLiteral::InBlob => blob_literal.push('+'),
+            },
+            '-' => match which_literal {
+                WhichLiteral::None => {
+                    push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
+                    tokens.push(Token::Operation(Operation::Sub));
                 }
+                WhichLiteral::InStr => string_literal.push('-'),
+                WhichLiteral::InBlob => blob_literal.push('-'),
+            },
+            '*' => match which_literal {
+                WhichLiteral::None => {
+                    push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
+                    tokens.push(Token::Star);
+                }
+                WhichLiteral::InStr => string_literal.push('*'),
+                WhichLiteral::InBlob => blob_literal.push('*'),
+            },
+            '/' => match which_literal {
+                WhichLiteral::None => {
+                    push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
+                    tokens.push(Token::Operation(Operation::Div));
+                }
+                WhichLiteral::InStr => string_literal.push('/'),
+                WhichLiteral::InBlob => blob_literal.push('/'),
+            },
 
-                if is_blob_char && !blob_literal.is_empty() {
-                    tokens.push(Token::Literal(Literal::Blob(
-                        blob_literal.as_bytes().to_vec(),
-                    )));
-                    is_blob_char = false;
-                    blob_literal.clear();
+            '(' => match which_literal {
+                WhichLiteral::None => {
+                    push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
+                    tokens.push(Token::LParen);
                 }
-                // if string_literal is not empty, then this is the closing single quote
-                else if is_str_char && !string_literal.is_empty() {
-                    tokens.push(Token::Literal(Literal::String(string_literal.clone())));
-                    is_str_char = false;
-                    string_literal.clear();
-                } else {
-                    is_str_char = true;
+                WhichLiteral::InStr => string_literal.push('('),
+                WhichLiteral::InBlob => blob_literal.push('('),
+            },
+            ')' => match which_literal {
+                WhichLiteral::None => {
+                    push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
+                    tokens.push(Token::RParen);
                 }
-            }
-            'X' if !is_str_char
-                && !is_blob_char
-                && (next.is_some_and(|&c| c == '\'') && blob_literal.is_empty()) =>
-            {
-                if let Some(&next_char) = next
-                    && next_char == '\''
-                {
-                    is_blob_char = true;
-                    skip = true;
+                WhichLiteral::InStr => string_literal.push(')'),
+                WhichLiteral::InBlob => blob_literal.push(')'),
+            },
+            ',' => match which_literal {
+                WhichLiteral::None => {
+                    push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
+                    tokens.push(Token::Comma);
                 }
-            }
-            c => {
-                if is_blob_char {
-                    blob_literal.push(c);
-                    continue;
+                WhichLiteral::InStr => string_literal.push(','),
+                WhichLiteral::InBlob => blob_literal.push(','),
+            },
+            ';' => match which_literal {
+                WhichLiteral::None => {
+                    push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
+                    tokens.push(Token::Semicolon);
                 }
-                if is_str_char {
-                    string_literal.push(c);
-                    continue;
+                WhichLiteral::InStr => string_literal.push(';'),
+                WhichLiteral::InBlob => blob_literal.push(';'),
+            },
+
+            '>' => match which_literal {
+                WhichLiteral::None => {
+                    push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
+                    if let Some(&next_char) = next
+                        && next_char == '='
+                    {
+                        tokens.push(Token::Operation(Operation::Gteq));
+                        skip = true;
+                    } else {
+                        tokens.push(Token::Operation(Operation::Gt));
+                    }
                 }
-                // Since .x can be parsed by rust into 0.x, we will allow it
-                if c == '.' {
-                    if let Some(next_char) = next {
-                        let period_invalid = period_already_in_literal(&numeric_literal)
-                            || a_number_does_not_follow_period(next_char);
-                        if period_invalid {
-                            anyhow::bail!("lexer error: unexpected period")
+                WhichLiteral::InStr => string_literal.push('>'),
+                WhichLiteral::InBlob => blob_literal.push('>'),
+            },
+            '=' => match which_literal {
+                WhichLiteral::None => {
+                    push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
+                    tokens.push(Token::Operation(Operation::Eq));
+                }
+                WhichLiteral::InStr => string_literal.push('='),
+                WhichLiteral::InBlob => blob_literal.push('='),
+            },
+            '<' => match which_literal {
+                WhichLiteral::None => {
+                    push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
+                    if let Some(&next_char) = next {
+                        match next_char {
+                            '=' => {
+                                tokens.push(Token::Operation(Operation::Lteq));
+                                skip = true;
+                            }
+                            '>' => {
+                                tokens.push(Token::Operation(Operation::Ne));
+                                skip = true;
+                            }
+                            _ => tokens.push(Token::Operation(Operation::Lt)),
                         }
                     } else {
-                        anyhow::bail!("lexer error: unexpected period")
+                        tokens.push(Token::Operation(Operation::Lt));
                     }
                 }
-
-                if c.is_ascii_alphabetic()
-                    || c == '_'
-                    || (c.is_ascii_digit() && !identity.is_empty())
-                {
-                    identity.push(c);
-                } else if c.is_ascii_digit() || c == '.' {
-                    numeric_literal.push(c);
-                } else {
-                    anyhow::bail!("lexer: invalid character {c} used")
+                WhichLiteral::InStr => string_literal.push('<'),
+                WhichLiteral::InBlob => blob_literal.push('<'),
+            },
+            '!' => match which_literal {
+                WhichLiteral::None => {
+                    if let Some(&next_char) = next
+                        && next_char == '='
+                    {
+                        push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
+                        tokens.push(Token::Operation(Operation::Ne));
+                        skip = true;
+                    } else {
+                        anyhow::bail!("lexer error: invalid character !")
+                    }
                 }
-            }
+                WhichLiteral::InStr => string_literal.push('!'),
+                WhichLiteral::InBlob => blob_literal.push('!'),
+            },
+            '\'' => match which_literal {
+                WhichLiteral::None => {
+                    which_literal = WhichLiteral::InStr;
+                }
+                WhichLiteral::InStr => {
+                    if let Some(&next_char) = next
+                        && next_char == '\''
+                    {
+                        string_literal.push('\'');
+                        skip = true;
+                    } else {
+                        tokens.push(Token::Literal(Literal::String(string_literal.clone())));
+                        string_literal.clear();
+                        which_literal = WhichLiteral::None;
+                    }
+                }
+                WhichLiteral::InBlob => {
+                    if let Some(b) = hex_to_bytes(&blob_literal) {
+                        tokens.push(Token::Literal(Literal::Blob(b)));
+                        blob_literal.clear();
+                        which_literal = WhichLiteral::None;
+                    } else {
+                        anyhow::bail!("lexer error: invalid hex string: {blob_literal}")
+                    }
+                }
+            },
+            'X' => match which_literal {
+                WhichLiteral::None => {
+                    if let Some(&next_char) = next
+                        && next_char == '\''
+                    {
+                        which_literal = WhichLiteral::InBlob;
+                        skip = true;
+                    } else {
+                        identity.push('X');
+                    }
+                }
+                WhichLiteral::InStr => string_literal.push('X'),
+                WhichLiteral::InBlob => blob_literal.push('X'),
+            },
+            c => match which_literal {
+                WhichLiteral::None => {
+                    //Since .x can be parsed by rust into 0.x, we will allow it
+                    if c == '.' {
+                        if let Some(next_char) = next {
+                            let period_invalid = period_already_in_literal(&numeric_literal)
+                                || a_number_does_not_follow_period(next_char);
+                            if period_invalid {
+                                anyhow::bail!("lexer error: unexpected period")
+                            }
+                        } else {
+                            anyhow::bail!("lexer error: unexpected period")
+                        }
+                    }
+
+                    if c.is_ascii_alphabetic()
+                        || c == '_'
+                        || (c.is_ascii_digit() && !identity.is_empty())
+                    {
+                        identity.push(c);
+                    } else if c.is_ascii_digit() || c == '.' {
+                        numeric_literal.push(c);
+                    } else {
+                        anyhow::bail!("lexer: invalid character {c} used")
+                    }
+                }
+                WhichLiteral::InStr => string_literal.push(c),
+                WhichLiteral::InBlob => blob_literal.push(c),
+            },
         }
     }
-    if is_str_char {
+    if which_literal == WhichLiteral::InStr || which_literal == WhichLiteral::InBlob {
         anyhow::bail!("lexer error: unterminated string literal");
     }
     push_buffers(&mut identity, &mut numeric_literal, &mut tokens)?;
@@ -307,7 +348,6 @@ fn lookup_sql_keyword(literal: &str) -> Option<Token> {
         "primary" | "PRIMARY" => Some(Token::Primary),
         "key" | "KEY" => Some(Token::Key),
         "unique" | "UNIQUE" => Some(Token::Unique),
-        "*" => Some(Token::Star),
         "values" | "VALUES" => Some(Token::Values),
         "from" | "FROM" => Some(Token::From),
         "where" | "WHERE" => Some(Token::Where),
@@ -322,10 +362,10 @@ fn lookup_sql_keyword(literal: &str) -> Option<Token> {
         "and" | "AND" => Some(Token::And),
         "not" | "NOT" => Some(Token::Not),
 
-        "INTEGER" => Some(Token::DataType(TypeName::Integer)),
-        "REAL" => Some(Token::DataType(TypeName::Real)),
-        "TEXT" => Some(Token::DataType(TypeName::Text)),
-        "BLOB" => Some(Token::DataType(TypeName::Blob)),
+        "integer" | "INTEGER" => Some(Token::DataType(TypeName::Integer)),
+        "real" | "REAL" => Some(Token::DataType(TypeName::Real)),
+        "text" | "TEXT" => Some(Token::DataType(TypeName::Text)),
+        "blob" | "BLOB" => Some(Token::DataType(TypeName::Blob)),
 
         "null" | "NULL" => Some(Token::Literal(Literal::Null)),
         _ => None,
@@ -395,6 +435,27 @@ fn push_buffers(
         identity.clear();
     }
     Ok(())
+}
+
+fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 == 0 {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| {
+                s.get(i..i + 2)
+                    .and_then(|sub| u8::from_str_radix(sub, 16).ok())
+            })
+            .collect()
+    } else {
+        None
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum WhichLiteral {
+    None,
+    InStr,
+    InBlob,
 }
 
 #[cfg(test)]
@@ -733,14 +794,9 @@ mod tests {
     }
 
     #[test]
-    fn blob_literal_with_content() {
-        assert_eq!(
-            tok("X'hello'").unwrap(),
-            vec![
-                Token::Literal(Literal::Blob(b"hello".to_vec())),
-                Token::Eof,
-            ]
-        );
+    fn blob_literal_with_non_hexadecimal_content_is_rejected() {
+        assert!(tok("X'hello'").is_err());
+        assert!(tok("X'a=b'").is_err());
     }
 
     #[test]
@@ -748,18 +804,20 @@ mod tests {
         assert!(tok("X'abc").is_err());
     }
 
-    #[test]
-    fn equals_sign_inside_a_blob_literal_is_preserved() {
-        assert_eq!(
-            tok("X'a=b'").unwrap(),
-            vec![Token::Literal(Literal::Blob(b"a=b".to_vec())), Token::Eof]
-        );
-    }
+    // blobs can only be in hexadecimal format
+    // #[test]
+    // fn equals_sign_inside_a_blob_literal_is_preserved() {
+    //     assert_eq!(
+    //         tok("X'a=b'").unwrap(),
+    //         vec![Token::Literal(Literal::Blob(b"a=b".to_vec())), Token::Eof]
+    //     );
+    // }
 
-    #[test]
-    fn mixed_case_keyword_is_recognized() {
-        assert_eq!(tok("Select").unwrap(), vec![Token::Select, Token::Eof]);
-    }
+    // Mixed case keywords are not allowed.
+    // #[test]
+    // fn mixed_case_keyword_is_recognized() {
+    //     assert_eq!(tok("Select").unwrap(), vec![Token::Select, Token::Eof]);
+    // }
 
     #[test]
     fn lowercase_type_name_is_recognized() {
