@@ -18,11 +18,58 @@ use crate::{
 pub struct TableCursor<'a> {
     pub pager: &'a mut Pager,
     root_pn: PageNumber,
+
+    // A stack frame = (current leaf page number, index of the next cell to visit)
+    stack: Vec<(PageNumber, usize)>,
+    started: bool,
 }
 
 impl<'a> TableCursor<'a> {
     pub fn new(pager: &'a mut Pager, root_pn: PageNumber) -> Self {
-        Self { pager, root_pn }
+        Self {
+            pager,
+            root_pn,
+            stack: Vec::new(),
+            started: false,
+        }
+    }
+
+    pub fn next_row(&mut self) -> anyhow::Result<Option<TableLeafCell>> {
+        if !self.started {
+            self.push_leftmost_path(self.root_pn)?;
+            self.started = true;
+        }
+        loop {
+            let Some(&(pn, idx)) = self.stack.last() else {
+                return Ok(None);
+            };
+            match self.fetch_page(pn)? {
+                Page::TableLeaf(lp) => {
+                    if idx < lp.cells().len() {
+                        // increment the cell index of the last frame
+                        self.stack.last_mut().unwrap().1 += 1;
+                        let mut cell = lp.cells()[idx].clone();
+                        cell.local_payload = self.materialize(&cell)?;
+                        return Ok(Some(cell));
+                    }
+                    self.stack.pop();
+                }
+                Page::TableInterior(ip) => {
+                    let child = if idx < ip.cells().len() {
+                        ip.cells()[idx].left_child
+                    } else if idx <= ip.cells().len() {
+                        ip.rightmost_child
+                    } else {
+                        anyhow::bail!("stack frame next cell index out of range")
+                    };
+                    self.stack.last_mut().unwrap().1 += 1;
+                    if idx <= ip.cells.len() {
+                        self.push_leftmost_path(child)?;
+                    }
+                }
+                _ => anyhow::bail!("expected table page, found index page"),
+            }
+        }
     }
 
     pub fn seek(&mut self, row_id: RowID) -> anyhow::Result<Option<TableLeafCell>> {
@@ -327,7 +374,7 @@ impl<'a> TableCursor<'a> {
                 } else {
                     Ok(RowID::try_from(1).unwrap())
                 }
-            },
+            }
             Page::TableInterior(ip) => self.get_max_row_id_from(ip.rightmost_child),
             Page::IndexLeaf(_) | Page::IndexInterior(_) => {
                 anyhow::bail!(
@@ -370,6 +417,23 @@ impl<'a> TableCursor<'a> {
         let mut full = cell.local_payload.clone();
         full.extend(self.pager.read_overflow(cell.overflow_pn, tail_len)?);
         Ok(full)
+    }
+
+    fn push_leftmost_path(&mut self, mut pn: PageNumber) -> anyhow::Result<()> {
+        loop {
+            self.stack.push((pn, 0));
+            match self.fetch_page(pn)? {
+                Page::TableLeaf(_) => return Ok(()),
+                Page::TableInterior(ip) => {
+                    pn = ip
+                        .cells
+                        .first()
+                        .map(|cell| cell.left_child)
+                        .unwrap_or(ip.rightmost_child)
+                }
+                _ => anyhow::bail!("expected table pages, not index pages"),
+            }
+        }
     }
 }
 

@@ -6,8 +6,7 @@ use crate::storage::{
         cell::Cell,
         spec::PageSpec,
         types::{PageNumber, RowID},
-    },
-    varint,
+    }, varint,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
